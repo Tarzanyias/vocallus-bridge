@@ -69,7 +69,10 @@ async function loadConfig(uid) {
     tz: u.timezone || DEFAULT_TZ,
     hours: u.hours || DEFAULT_HOURS,
     len: Number(u.appointmentLength) || 30,
-    business: u.company || ''
+    business: u.company || '',
+    afterHours: ['message', 'book', 'forward', 'closed'].includes(u.afterHours) ? u.afterHours : 'message',
+    afterHoursMessage: String(u.afterHoursMessage || '').slice(0, 400),
+    afterHoursForward: /^\+1\d{10}$/.test(u.afterHoursForward || '') ? u.afterHoursForward : ''
   };
 }
 
@@ -116,6 +119,80 @@ function todayText(tz) {
   const p = tzParts(now, tz);
   const pretty = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
   return `${pretty} (${p.year}-${p.month}-${p.day})`;
+}
+
+/* AFTER_HOURS helpers */
+const DAY_NAMES = { sun: 'Sunday', mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday' };
+const WEEK_ORDER = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+function nowInTz(tz) {
+  const p = tzParts(new Date(), tz);
+  const wd = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(new Date()).slice(0, 3).toLowerCase();
+  return { day: wd, min: (Number(p.hour) % 24) * 60 + Number(p.minute) };
+}
+function dayIsOpen(h) {
+  return !!(h && !h.closed && h.open && h.close && toMin(h.close) > toMin(h.open));
+}
+function isOpenNow(cfg) {
+  try {
+    const n = nowInTz(cfg.tz);
+    const h = cfg.hours[n.day];
+    return dayIsOpen(h) && n.min >= toMin(h.open) && n.min < toMin(h.close);
+  } catch { return true; }
+}
+function hoursText(cfg) {
+  return WEEK_ORDER.map(k => {
+    const h = cfg.hours[k];
+    return DAY_NAMES[k] + ' ' + (dayIsOpen(h) ? to12(h.open) + ' to ' + to12(h.close) : 'closed');
+  }).join('; ');
+}
+function nextOpenText(cfg) {
+  try {
+    const n = nowInTz(cfg.tz);
+    const start = DAY_KEYS.indexOf(n.day);
+    for (let i = 0; i < 8; i++) {
+      const k = DAY_KEYS[(start + i) % 7];
+      const h = cfg.hours[k];
+      if (!dayIsOpen(h)) continue;
+      if (i === 0 && n.min >= toMin(h.open)) continue;
+      const when = i === 0 ? 'today' : i === 1 ? 'tomorrow' : DAY_NAMES[k];
+      return `${when} at ${to12(h.open)}`;
+    }
+  } catch {}
+  return '';
+}
+function closedGreeting(cfg) {
+  if (cfg.afterHoursMessage) return cfg.afterHoursMessage;
+  const next = nextOpenText(cfg);
+  return `Thanks for calling${cfg.business ? ' ' + cfg.business : ''}. We're closed right now.` +
+    (next ? ` We open again ${next}.` : '') + ' Please call back then. Goodbye.';
+}
+function hoursPrompt(cfg) {
+  let s = `\n\nBusiness hours (${cfg.tz}): ${hoursText(cfg)}.`;
+  if (isOpenNow(cfg)) {
+    s += ' The business is OPEN right now.';
+  } else {
+    const next = nextOpenText(cfg);
+    s += ` The business is CLOSED right now${next ? ' and opens again ' + next : ''}. Let the caller know early in the call.`;
+    if (cfg.afterHours === 'book') {
+      s += ' You can still help: book them into an upcoming open time with the calendar tools, or take a message.';
+    } else {
+      s += ' Offer to take a message so the team can call them back. If they ask, you can also book a time when the business is open.';
+    }
+    if (cfg.afterHoursMessage) s += ` Open the call with something close to: "${cfg.afterHoursMessage}"`;
+  }
+  s += " To take a message: get the caller's name, the best number to call back, and a short reason," +
+    ' read it back to confirm, then call take_message.';
+  return s;
+}
+async function logQuickCall(uid, from, status) {
+  if (!db || !uid) return;
+  try {
+    await db.collection(`users/${uid}/calls`).add({
+      from, status, durationSec: 0,
+      startedAt: admin.firestore.FieldValue.serverTimestamp(),
+      endedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (e) { app.log.error('Call log failed: ' + e.message); }
 }
 
 /* ---------------- calendar ---------------- */
@@ -172,6 +249,19 @@ const TOOLS = [{
         },
         required: ['date', 'time', 'customer_name']
       }
+    },
+    {
+      name: 'take_message',
+      description: 'Save a message for the business. Call this after you have the caller\'s name, callback number and message, and have read it back to them.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          caller_name: { type: 'STRING' },
+          callback_number: { type: 'STRING', description: 'Best number to call back' },
+          message: { type: 'STRING', description: 'What the caller needs, in a sentence or two' }
+        },
+        required: ['caller_name', 'message']
+      }
     }
   ]
 }];
@@ -204,6 +294,17 @@ async function runTool(cfg, name, args, callerPhone) {
       });
       app.log.info(`Booked ${args.date} ${time} for ${args.customer_name} (user ${cfg.uid})`);
       return { booked: true, date: args.date, time: to12(time) };
+    }
+    if (name === 'take_message') {
+      const message = {
+        name: String(args.caller_name || '').slice(0, 100),
+        phone: String(args.callback_number || callerPhone || '').slice(0, 40),
+        reason: String(args.message || '').slice(0, 1000),
+        at: admin.firestore.Timestamp.now()
+      };
+      if (cfg.callRef) await cfg.callRef.set({ message }, { merge: true });
+      app.log.info(`Message taken for ${cfg.uid} from ${message.name}`);
+      return { saved: true };
     }
     return { error: 'Unknown tool' };
   } catch (e) {
@@ -287,6 +388,21 @@ app.post('/incoming-call', async (req, reply) => {
         return sayAndHang(reply, 'Sorry, this line is not active yet. Goodbye.');
       }
       const cfg = await loadConfig(tenant.uid);
+      if (!isOpenNow(cfg)) {
+        if (cfg.afterHours === 'closed') {
+          await logQuickCall(tenant.uid, from, 'after-hours');
+          return sayAndHang(reply, closedGreeting(cfg));
+        }
+        if (cfg.afterHours === 'forward' && cfg.afterHoursForward && cfg.afterHoursForward !== to) {
+          await logQuickCall(tenant.uid, from, 'forwarded');
+          return reply.type('text/xml').send(
+            '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+            `<Dial timeout="25">${xml(cfg.afterHoursForward)}</Dial>` +
+            `<Say>${xml('Sorry, no one could pick up. Please call back during business hours. Goodbye.')}</Say>` +
+            '</Response>'
+          );
+        }
+      }
       if (!cfg.key) {
         return sayAndHang(reply, 'Sorry, this line is not finished being set up. Please try again later.');
       }
@@ -321,6 +437,7 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
         (cfg.business ? ` You answer the phone for ${cfg.business}.` : '') +
         ` Today is ${todayText(cfg.tz)}. The caller's number is ${from || 'unknown'}.` +
         ' Speak like a real person on the phone and keep replies short.';
+      if (cfg.uid) system += hoursPrompt(cfg);
       if (cfg.uid) {
         system += ' To book: ask what day they want, call check_availability for that date, offer a few of the returned times,' +
           ' get their name, confirm the date and time back to them, then call book_appointment. Never invent open times.' +
@@ -402,6 +519,7 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
           callRef = await db.collection(`users/${cfg.uid}/calls`).add({
             from, startedAt: admin.firestore.FieldValue.serverTimestamp(), status: 'in-progress'
           });
+          cfg.callRef = callRef;
         } catch (e) { app.log.error('Call log failed: ' + e.message); }
       }
       openGemini();
