@@ -58,7 +58,7 @@ async function loadConfig(uid) {
   let key = DEFAULT_KEY;                       // Max plan: your key
   if (u.plan === 'pro') {                      // Pro plan: their own key
     const ai = (await db.doc(`users/${uid}/private/ai`).get()).data() || {};
-    key = ai.apiKey || null;
+    key = (ai.apiKey && (!ai.provider || ai.provider === 'gemini')) ? ai.apiKey : null;
   }
   return {
     uid,
@@ -427,6 +427,7 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
   let streamSid = null, gemini = null, geminiReady = false;
   let cfg = null, from = '', callRef = null, startedAt = Date.now();
   const pending = [];
+  const transcript = [];
 
   function openGemini() {
     gemini = new WebSocket(GEMINI_URL + encodeURIComponent(cfg.key));
@@ -449,7 +450,9 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
           responseModalities: ['AUDIO'],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } }
         },
-        systemInstruction: { parts: [{ text: system }] }
+        systemInstruction: { parts: [{ text: system }] },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {}
       };
       if (cfg.uid) setup.tools = TOOLS;
       gemini.send(JSON.stringify({ setup }));
@@ -487,6 +490,8 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
         if (msg.error) app.log.error('Gemini error: ' + JSON.stringify(msg.error));
         return;
       }
+      if (sc.inputTranscription && sc.inputTranscription.text) addLine(transcript, 'Caller', sc.inputTranscription.text);
+      if (sc.outputTranscription && sc.outputTranscription.text) addLine(transcript, cfg.agentName, sc.outputTranscription.text);
       if (sc.interrupted && streamSid) twilio.send(JSON.stringify({ event: 'clear', streamSid }));
       for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
         if (p.inlineData && p.inlineData.data && streamSid) {
@@ -545,6 +550,7 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
         });
       } catch {}
     }
+    finishCall(cfg, callRef, transcript, from, Math.round((Date.now() - startedAt) / 1000)).catch(() => {});
   });
 });
 
@@ -717,6 +723,306 @@ app.post('/stripe/webhook', async (req, reply) => {
     return reply.code(500).send({ error: 'failed' });
   }
   return { received: true };
+});
+
+/* SOLANA_LIVE block */
+/* ---------------- summaries, alerts, test chat & test call ---------------- */
+const SITE_URL = (process.env.SITE_URL || 'https://vocallus.netlify.app').replace(/\/$/, '');
+const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
+
+const fmtNum = (n) => {
+  let d = String(n || '').replace(/\D/g, '');
+  if (d.length === 11 && d[0] === '1') d = d.slice(1);
+  return d.length === 10 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : (n || 'unknown caller');
+};
+function addLine(transcript, who, text) {
+  if (!text) return;
+  const last = transcript[transcript.length - 1];
+  if (last && last.who === who) last.text += text;
+  else if (transcript.length < 400) transcript.push({ who, text });
+}
+const transcriptText = (t) => t.map(l => `${l.who}: ${l.text.trim()}`).join('\n');
+
+async function geminiText(key, system, contents, tools) {
+  const body = { contents };
+  if (system) body.systemInstruction = { parts: [{ text: system }] };
+  if (tools) body.tools = tools;
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${encodeURIComponent(key)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+  );
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((j.error && j.error.message) || `Gemini error ${res.status}`);
+  return j;
+}
+const partsOf = (j) => (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+
+async function summarize(key, transcript, agentName) {
+  if (!key || !transcript.length) return '';
+  try {
+    const j = await geminiText(key,
+      'You write very short phone call summaries for a business owner. One or two plain sentences, no greeting, no markdown. ' +
+      'Say who called (their name if given), what they wanted, and what happened (appointment booked, message taken, question answered).',
+      [{ role: 'user', parts: [{ text: `Call answered by ${agentName}:\n\n` + transcriptText(transcript).slice(0, 12000) }] }]);
+    return partsOf(j).map(p => p.text || '').join('').trim().slice(0, 600);
+  } catch (e) {
+    app.log.error('Summary failed: ' + e.message);
+    return '';
+  }
+}
+
+async function notifyOwner(uid, title, body, link) {
+  if (!db || !uid) return { sent: 0, reason: 'no-db' };
+  try {
+    const ref = db.doc(`users/${uid}/private/push`);
+    const d = (await ref.get()).data() || {};
+    const tokens = Array.isArray(d.tokens) ? d.tokens.filter(Boolean) : [];
+    if (!d.enabled || !tokens.length) return { sent: 0, reason: 'off' };
+    const r = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title: String(title).slice(0, 100), body: String(body || '').slice(0, 240) },
+      webpush: {
+        fcmOptions: { link: link || `${SITE_URL}/Pages/history.html` },
+        notification: { icon: `${SITE_URL}/Images/favicon.png` }
+      }
+    });
+    const dead = [];
+    r.responses.forEach((x, i) => {
+      const c = !x.success && x.error && x.error.code;
+      if (c === 'messaging/registration-token-not-registered' || c === 'messaging/invalid-registration-token' ||
+          c === 'messaging/invalid-argument') dead.push(tokens[i]);
+    });
+    if (dead.length) await ref.set({ tokens: admin.firestore.FieldValue.arrayRemove(...dead) }, { merge: true });
+    return { sent: r.successCount, reason: r.successCount ? 'ok' : 'failed' };
+  } catch (e) {
+    app.log.error('Alert failed: ' + e.message);
+    return { sent: 0, reason: e.message };
+  }
+}
+
+const durText = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+// Phone calls: summary + transcript on the call, then an alert.
+async function finishCall(cfg, callRef, transcript, from, durationSec) {
+  if (!cfg || !cfg.uid) return;
+  const summary = await summarize(cfg.key, transcript, cfg.agentName);
+  if (callRef) {
+    try {
+      await callRef.set({
+        summary,
+        transcript: transcript.slice(0, 200).map(l => ({ who: l.who, text: l.text.trim().slice(0, 2000) }))
+      }, { merge: true });
+    } catch (e) { app.log.error('Saving summary failed: ' + e.message); }
+  }
+  await notifyOwner(cfg.uid, `${cfg.agentName} · call from ${fmtNum(from)}`,
+    summary || `Call ended after ${durText(durationSec)}.`);
+}
+
+function buildSystem(cfg, from, channel) {
+  let s = cfg.prompt +
+    `\n\nYour name is ${cfg.agentName}.` +
+    (cfg.business ? ` You answer the phone for ${cfg.business}.` : '') +
+    ` Today is ${todayText(cfg.tz)}.`;
+  if (channel === 'chat') {
+    s += " This is a text chat test from the business owner's dashboard. Treat them like a real customer." +
+      ' Reply in short, natural sentences like you would on the phone. Plain text only, no markdown.';
+  } else {
+    s += ` The caller's number is ${from || 'unknown'}. Speak like a real person on the phone and keep replies short.`;
+  }
+  if (cfg.uid) {
+    s += hoursPrompt(cfg);
+    s += ' To book: ask what day they want, call check_availability for that date, offer a few of the returned times,' +
+      ' get their name, confirm the date and time back to them, then call book_appointment. Never invent open times.' +
+      ' Say times in 12-hour format like 2:30 PM.';
+  }
+  return s;
+}
+
+// Daily test limits (in memory; resets when the server restarts or the day changes).
+const demoUse = new Map();
+function demoBucket(uid) {
+  const day = new Date().toISOString().slice(0, 10);
+  let u = demoUse.get(uid);
+  if (!u || u.day !== day) { u = { day, chat: 0, sec: 0 }; demoUse.set(uid, u); }
+  return u;
+}
+
+app.get('/api/config', async (req, reply) => {
+  setCors(req, reply);
+  return { vapidKey: process.env.FIREBASE_VAPID_KEY || '' };
+});
+
+app.post('/api/alerts/test', async (req, reply) => {
+  const user = await requireUser(req, reply);
+  if (!user) return reply;
+  const name = user.data.agentName || 'Solana';
+  const r = await notifyOwner(user.uid, `${name} alerts are on`,
+    "You'll get a short summary here after every call.", `${SITE_URL}/Pages/dashboard.html`);
+  if (!r.sent) return reply.code(400).send({ error: r.reason === 'off' ? 'Alerts are off for this account.' : 'Could not send: ' + r.reason });
+  return { sent: r.sent };
+});
+
+app.post('/api/demo/chat', async (req, reply) => {
+  const user = await requireUser(req, reply);
+  if (!user) return reply;
+  const paid = ['pro', 'max'].includes(user.data.plan);
+  const b = demoBucket(user.uid);
+  if (b.chat >= (paid ? 500 : 150)) return reply.code(429).send({ error: "You've hit today's test limit. Try again tomorrow." });
+  b.chat++;
+
+  const msgs = Array.isArray(req.body && req.body.messages) ? req.body.messages.slice(-30) : [];
+  if (!msgs.length) return reply.code(400).send({ error: 'Type a message first.' });
+  let cfg;
+  try { cfg = await loadConfig(user.uid); } catch (e) { return reply.code(500).send({ error: 'Could not load your settings.' }); }
+  const key = cfg.key || DEFAULT_KEY;
+  if (!key) return reply.code(500).send({ error: 'No AI key is set up.' });
+
+  const contents = msgs.map(m => ({
+    role: m.role === 'user' ? 'user' : 'model',
+    parts: [{ text: String(m.text || '').slice(0, 2000) }]
+  }));
+  try {
+    for (let i = 0; i < 5; i++) {
+      const j = await geminiText(key, buildSystem(cfg, '', 'chat'), contents, TOOLS);
+      const parts = partsOf(j);
+      const calls = parts.filter(p => p.functionCall);
+      if (!calls.length) {
+        const text = parts.map(p => p.text || '').join('').trim();
+        return { reply: text || 'Sorry, could you say that again?' };
+      }
+      contents.push({ role: 'model', parts });
+      const responses = [];
+      for (const p of calls) {
+        responses.push({ functionResponse: {
+          name: p.functionCall.name,
+          response: await runTool(cfg, p.functionCall.name, p.functionCall.args || {}, '')
+        } });
+      }
+      contents.push({ role: 'user', parts: responses });
+    }
+    return { reply: 'Sorry, could you say that again?' };
+  } catch (e) {
+    app.log.error('Test chat: ' + e.message);
+    return reply.code(502).send({ error: /API key/i.test(e.message) ? 'Your Gemini API key was rejected. Check it on the Solana page.' : e.message });
+  }
+});
+
+// Browser test call: mic audio (16 kHz PCM) in, Solana's voice (24 kHz PCM) out.
+app.get('/demo-call', { websocket: true }, (sock, req) => {
+  const origin = req.headers.origin;
+  if (origin && !ALLOWED_ORIGINS.includes(origin)) { try { sock.close(1008, 'origin not allowed'); } catch {} return; }
+
+  let gemini = null, ready = false, cfg = null, uid = null, started = 0, timer = null, closed = false;
+  const transcript = [];
+  const send = (o) => { try { if (sock.readyState === 1) sock.send(JSON.stringify(o)); } catch {} };
+
+  function end(reason) {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    try { gemini && gemini.close(); } catch {}
+    send({ type: 'ended', reason });
+    try { sock.close(); } catch {}
+    const secs = started ? Math.round((Date.now() - started) / 1000) : 0;
+    if (uid) demoBucket(uid).sec += secs;
+    if (cfg && cfg.uid && transcript.length) {
+      (async () => {
+        const summary = await summarize(cfg.key || DEFAULT_KEY, transcript, cfg.agentName);
+        await notifyOwner(cfg.uid, `${cfg.agentName} · test call`, summary || `Test call ended after ${durText(secs)}.`);
+      })().catch(() => {});
+    }
+  }
+
+  sock.on('message', async (raw) => {
+    let m;
+    try { m = JSON.parse(raw.toString()); } catch { return; }
+
+    if (m.type === 'start' && !cfg) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(String(m.token || ''));
+        uid = decoded.uid;
+        cfg = await loadConfig(uid);
+      } catch (e) {
+        send({ type: 'error', error: 'Please sign in again.' });
+        return end('auth');
+      }
+      const paid = ['pro', 'max'].includes(cfg.plan);
+      const left = (paid ? 3600 : 900) - demoBucket(uid).sec;
+      if (left <= 10) { send({ type: 'error', error: "You've used today's test call time. Try again tomorrow." }); return end('limit'); }
+      const key = cfg.key || DEFAULT_KEY;
+      if (!key) { send({ type: 'error', error: 'No AI key is set up.' }); return end('nokey'); }
+
+      gemini = new WebSocket(GEMINI_URL + encodeURIComponent(key));
+      gemini.on('open', () => {
+        const setup = {
+          model: `models/${MODEL}`,
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } }
+          },
+          systemInstruction: { parts: [{ text: buildSystem(cfg, '', 'call') }] },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          tools: TOOLS
+        };
+        gemini.send(JSON.stringify({ setup }));
+      });
+      gemini.on('message', async (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (msg.setupComplete) {
+          ready = true;
+          started = Date.now();
+          timer = setTimeout(() => end('limit'), Math.min(300, left) * 1000);
+          gemini.send(JSON.stringify({ clientContent: {
+            turns: [{ role: 'user', parts: [{ text: 'A caller just connected. Greet them warmly and ask how you can help.' }] }],
+            turnComplete: true
+          } }));
+          send({ type: 'live', maxSec: Math.min(300, left), agentName: cfg.agentName });
+          return;
+        }
+        if (msg.toolCall) {
+          const calls = msg.toolCall.functionCalls || [];
+          calls.forEach(c => send({ type: 'tool', name: c.name }));
+          const functionResponses = await Promise.all(calls.map(async c => ({
+            id: c.id, name: c.name, response: await runTool(cfg, c.name, c.args || {}, '')
+          })));
+          if (gemini.readyState === WebSocket.OPEN) gemini.send(JSON.stringify({ toolResponse: { functionResponses } }));
+          return;
+        }
+        const sc = msg.serverContent;
+        if (!sc) {
+          if (msg.error) send({ type: 'error', error: msg.error.message || 'AI error' });
+          return;
+        }
+        if (sc.interrupted) send({ type: 'clear' });
+        if (sc.inputTranscription && sc.inputTranscription.text) {
+          addLine(transcript, 'Caller', sc.inputTranscription.text);
+          send({ type: 'caption', who: 'you', text: sc.inputTranscription.text });
+        }
+        if (sc.outputTranscription && sc.outputTranscription.text) {
+          addLine(transcript, cfg.agentName, sc.outputTranscription.text);
+          send({ type: 'caption', who: 'agent', text: sc.outputTranscription.text });
+        }
+        for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
+          if (p.inlineData && p.inlineData.data) send({ type: 'audio', data: p.inlineData.data });
+        }
+      });
+      gemini.on('close', (code, reason) => {
+        if (closed) return;
+        const why = reason ? reason.toString() : '';
+        if (code !== 1000) send({ type: 'error', error: /API key/i.test(why) ? 'Your Gemini API key was rejected. Check it on the Solana page.' : (why || 'The AI connection closed.') });
+        end('ai');
+      });
+      gemini.on('error', (err) => app.log.error('Test call socket error: ' + err.message));
+    } else if (m.type === 'audio' && ready && gemini && gemini.readyState === WebSocket.OPEN && typeof m.data === 'string') {
+      gemini.send(JSON.stringify({ realtimeInput: { audio: { data: m.data, mimeType: 'audio/pcm;rate=16000' } } }));
+    } else if (m.type === 'stop') {
+      end('user');
+    }
+  });
+  sock.on('close', () => end('closed'));
+  sock.on('error', () => end('error'));
 });
 
 const port = process.env.PORT || 8080;
