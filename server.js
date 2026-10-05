@@ -64,6 +64,7 @@ async function loadConfig(uid) {
   return {
     uid,
     provider,
+    voice: u.voice === 'male' ? 'male' : 'female',
     plan: u.plan,
     prompt: u.systemPrompt || DEFAULT_PROMPT,
     agentName: u.agentName || 'Solana',
@@ -662,6 +663,8 @@ const SITE_URL = (process.env.SITE_URL || 'https://vocallus.netlify.app').replac
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const OPENAI_VOICE = process.env.OPENAI_VOICE || 'marin';
+const OPENAI_VOICE_MALE = process.env.OPENAI_VOICE_MALE || 'cedar';
+const GEMINI_VOICE_MALE = process.env.GEMINI_VOICE_MALE || 'Charon';
 const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe';
 const OPENAI_TEXT_MODEL = process.env.OPENAI_TEXT_MODEL || 'gpt-4.1-mini';
 
@@ -705,7 +708,7 @@ function geminiAgent(cfg, o) {
       model: `models/${MODEL}`,
       generationConfig: {
         responseModalities: ['AUDIO'],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } }
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: cfg.voice === 'male' ? GEMINI_VOICE_MALE : VOICE } } }
       },
       systemInstruction: { parts: [{ text: o.system }] },
       inputAudioTranscription: {},
@@ -785,7 +788,7 @@ function openaiAgent(cfg, o) {
       output_modalities: ['audio'],
       audio: {
         input: { format: fmt, transcription: { model: OPENAI_TRANSCRIBE_MODEL }, turn_detection: { type: 'server_vad' } },
-        output: { format: fmt, voice: OPENAI_VOICE }
+        output: { format: fmt, voice: cfg.voice === 'male' ? OPENAI_VOICE_MALE : OPENAI_VOICE }
       },
       tools: o.tools ? OPENAI_TOOLS : [],
       tool_choice: 'auto'
