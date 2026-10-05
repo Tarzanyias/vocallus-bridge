@@ -65,7 +65,8 @@ async function loadConfig(uid) {
     uid,
     provider,
     // VOICE_SET: Pro voices only on paid plans
-    voice: (['pro', 'max'].includes(u.plan) && ['female', 'male'].includes(u.voice)) ? u.voice : 'default',
+    voice: ((['pro', 'max'].includes(u.plan) && ['female', 'male'].includes(u.voice)) ||
+            (u.plan === 'max' && ['mmale', 'mfmale', 'rmale'].includes(u.voice))) ? u.voice : 'default',
     plan: u.plan,
     prompt: u.systemPrompt || DEFAULT_PROMPT,
     agentName: u.agentName || 'Solana',
@@ -697,7 +698,94 @@ function pcm16kTo24k(b64) {
 }
 
 // io: 'phone' (Twilio mu-law 8k in/out) or 'browser' (PCM 16k in, PCM 24k out)
+/* ELEVEN_VOICES */
+const ELEVEN_KEY = process.env.ELEVENLABS_API_KEY || '';
+const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
+const ELEVEN_VOICES = {
+  mmale: process.env.ELEVENLABS_VOICE_PRO_MALE || 'nPczCjzI2devNBz1zQrb',     // Brian
+  mfmale: process.env.ELEVENLABS_VOICE_PRO_FEMALE || 'EXAVITQu4vr4xnSDxMaL',  // Sarah
+  rmale: process.env.ELEVENLABS_VOICE_RUSTIC_MALE || 'pqHfZKP75CvOlQylNhV4'   // Bill
+};
+
+// One ElevenLabs stream per spoken turn. Text goes in, audio (mu-law 8k or PCM 24k) comes out.
+function elevenStream(voiceId, fmt, onAudio, onDone) {
+  const ws = new WebSocket(
+    `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${encodeURIComponent(ELEVEN_MODEL)}` +
+    `&output_format=${fmt}&inactivity_timeout=60`,
+    { headers: { 'xi-api-key': ELEVEN_KEY } });
+  let open = false, dead = false, buf = '';
+  const queue = [];
+  const send = (obj) => {
+    if (dead) return;
+    if (open && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    else queue.push(obj);
+  };
+  ws.on('open', () => {
+    open = true;
+    ws.send(JSON.stringify({ text: ' ', voice_settings: { stability: 0.5, similarity_boost: 0.8, speed: 1 } }));
+    while (queue.length) ws.send(JSON.stringify(queue.shift()));
+  });
+  ws.on('message', (d) => {
+    if (dead) return;
+    let m;
+    try { m = JSON.parse(d.toString()); } catch { return; }
+    if (m.audio) onAudio(m.audio);
+    else if (m.error || (m.message && !m.isFinal && !m.is_final)) app.log.error('ElevenLabs: ' + (m.error || m.message));
+  });
+  ws.on('unexpected-response', (req, res) => {
+    try { req.destroy(); } catch {}
+    app.log.error(`ElevenLabs HTTP ${res.statusCode}` + (res.statusCode === 401 ? ' (check ELEVENLABS_API_KEY)' : ''));
+    dead = true;
+    if (onDone) onDone();
+  });
+  ws.on('close', () => { dead = true; if (onDone) onDone(); });
+  ws.on('error', (e) => app.log.error('ElevenLabs socket: ' + e.message));
+
+  // Send whole sentences (or long phrases) so speech starts fast and sounds natural.
+  function pump(force) {
+    for (;;) {
+      const m = buf.match(/^([\s\S]*?[.!?](?:["')\]]*))\s+/);
+      if (m) { send({ text: m[1] + ' ', flush: true }); buf = buf.slice(m[0].length); continue; }
+      if (buf.length > 90) {
+        const cut = Math.max(buf.lastIndexOf(', ', 90), buf.lastIndexOf(' ', 90));
+        if (cut > 20) { send({ text: buf.slice(0, cut + 1) + ' ', flush: true }); buf = buf.slice(cut + 1); continue; }
+      }
+      break;
+    }
+    if (force && buf.trim()) { send({ text: buf.trim() + ' ', flush: true }); buf = ''; }
+  }
+  return {
+    push(text) { buf += text; pump(false); },
+    end() { pump(true); send({ text: '' }); },
+    cancel() { dead = true; try { ws.close(); } catch {} }
+  };
+}
+
+// Mute the AI's own voice and speak its words with ElevenLabs instead.
+function withEleven(o, voiceId) {
+  const fmt = o.io === 'phone' ? 'ulaw_8000' : 'pcm_24000';
+  let tts = null;
+  const current = () => {
+    if (!tts) {
+      const inst = elevenStream(voiceId, fmt, (b64) => o.onAudio(b64), () => { if (tts === inst) tts = null; });
+      tts = inst;
+    }
+    return tts;
+  };
+  return Object.assign({}, o, {
+    onAudio: () => {},
+    onCaption: (who, text) => {
+      if (o.onCaption) o.onCaption(who, text);
+      if (who === 'agent' && text) current().push(text);
+    },
+    onTurnEnd: () => { if (tts) { tts.end(); tts = null; } if (o.onTurnEnd) o.onTurnEnd(); },
+    onClear: () => { if (tts) { tts.cancel(); tts = null; } if (o.onClear) o.onClear(); }
+  });
+}
+
 function openAgent(cfg, o) {
+  const elevenId = ELEVEN_VOICES[cfg.voice];
+  if (elevenId && ELEVEN_KEY) o = withEleven(o, elevenId);
   return (cfg.provider === 'openai' ? openaiAgent : geminiAgent)(cfg, o);
 }
 
@@ -754,6 +842,7 @@ function geminiAgent(cfg, o) {
     for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
       if (p.inlineData && p.inlineData.data) o.onAudio(o.io === 'phone' ? geminiToTwilio(p.inlineData.data) : p.inlineData.data);
     }
+    if ((sc.turnComplete || sc.generationComplete) && o.onTurnEnd) o.onTurnEnd();
   });
   ws.on('close', (code, reason) => {
     if (closed) return;
@@ -823,6 +912,7 @@ function openaiAgent(cfg, o) {
         if (ev.transcript && o.onCaption) o.onCaption('caller', ev.transcript + ' ');
         break;
       case 'response.done': {
+        if (o.onTurnEnd) o.onTurnEnd();
         const calls = ((ev.response && ev.response.output) || []).filter(it => it.type === 'function_call');
         if (!calls.length) break;
         toolBusy++;
