@@ -55,13 +55,15 @@ async function loadConfig(uid) {
              tz: DEFAULT_TZ, hours: DEFAULT_HOURS, len: 30, business: '' };
   }
   const u = (await db.doc(`users/${uid}`).get()).data() || {};
-  let key = DEFAULT_KEY;                       // Max plan: your key
-  if (u.plan === 'pro') {                      // Pro plan: their own key
+  let key = DEFAULT_KEY, provider = 'gemini';   // Max plan: your Gemini key
+  if (u.plan === 'pro') {                         // Pro plan: their own Google or OpenAI key
     const ai = (await db.doc(`users/${uid}/private/ai`).get()).data() || {};
-    key = (ai.apiKey && (!ai.provider || ai.provider === 'gemini')) ? ai.apiKey : null;
+    provider = ai.provider === 'openai' ? 'openai' : 'gemini';
+    key = (ai.apiKey && (!ai.provider || ai.provider === 'gemini' || ai.provider === 'openai')) ? ai.apiKey : null;
   }
   return {
     uid,
+    provider,
     plan: u.plan,
     prompt: u.systemPrompt || DEFAULT_PROMPT,
     agentName: u.agentName || 'Solana',
@@ -424,88 +426,8 @@ app.post('/incoming-call', async (req, reply) => {
 /* ---------------- the bridge ---------------- */
 
 app.get('/media-stream', { websocket: true }, (twilio) => {
-  let streamSid = null, gemini = null, geminiReady = false;
-  let cfg = null, from = '', callRef = null, startedAt = Date.now();
-  const pending = [];
+  let streamSid = null, agent = null, cfg = null, from = '', callRef = null, startedAt = Date.now();
   const transcript = [];
-
-  function openGemini() {
-    gemini = new WebSocket(GEMINI_URL + encodeURIComponent(cfg.key));
-
-    gemini.on('open', () => {
-      let system = cfg.prompt +
-        `\n\nYour name is ${cfg.agentName}.` +
-        (cfg.business ? ` You answer the phone for ${cfg.business}.` : '') +
-        ` Today is ${todayText(cfg.tz)}. The caller's number is ${from || 'unknown'}.` +
-        ' Speak like a real person on the phone and keep replies short.';
-      if (cfg.uid) system += hoursPrompt(cfg);
-      if (cfg.uid) {
-        system += ' To book: ask what day they want, call check_availability for that date, offer a few of the returned times,' +
-          ' get their name, confirm the date and time back to them, then call book_appointment. Never invent open times.' +
-          ' Say times in 12-hour format like 2:30 PM.';
-      }
-      const setup = {
-        model: `models/${MODEL}`,
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } }
-        },
-        systemInstruction: { parts: [{ text: system }] },
-        inputAudioTranscription: {},
-        outputAudioTranscription: {}
-      };
-      if (cfg.uid) setup.tools = TOOLS;
-      gemini.send(JSON.stringify({ setup }));
-    });
-
-    gemini.on('message', async (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-
-      if (msg.setupComplete) {
-        geminiReady = true;
-        gemini.send(JSON.stringify({
-          clientContent: {
-            turns: [{ role: 'user', parts: [{ text: 'A caller just connected. Greet them warmly and ask how you can help.' }] }],
-            turnComplete: true
-          }
-        }));
-        while (pending.length) gemini.send(pending.shift());
-        return;
-      }
-
-      if (msg.toolCall) {
-        const calls = msg.toolCall.functionCalls || [];
-        const functionResponses = await Promise.all(calls.map(async c => ({
-          id: c.id, name: c.name, response: await runTool(cfg, c.name, c.args || {}, from)
-        })));
-        if (gemini.readyState === WebSocket.OPEN) {
-          gemini.send(JSON.stringify({ toolResponse: { functionResponses } }));
-        }
-        return;
-      }
-
-      const sc = msg.serverContent;
-      if (!sc) {
-        if (msg.error) app.log.error('Gemini error: ' + JSON.stringify(msg.error));
-        return;
-      }
-      if (sc.inputTranscription && sc.inputTranscription.text) addLine(transcript, 'Caller', sc.inputTranscription.text);
-      if (sc.outputTranscription && sc.outputTranscription.text) addLine(transcript, cfg.agentName, sc.outputTranscription.text);
-      if (sc.interrupted && streamSid) twilio.send(JSON.stringify({ event: 'clear', streamSid }));
-      for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
-        if (p.inlineData && p.inlineData.data && streamSid) {
-          twilio.send(JSON.stringify({ event: 'media', streamSid, media: { payload: geminiToTwilio(p.inlineData.data) } }));
-        }
-      }
-    });
-
-    gemini.on('close', (code, reason) => {
-      app.log.info(`Gemini closed: ${code} ${reason ? reason.toString() : ''}`);
-      try { twilio.close(); } catch {}
-    });
-    gemini.on('error', (err) => app.log.error('Gemini socket error: ' + err.message));
-  }
 
   twilio.on('message', async (raw) => {
     let msg;
@@ -518,7 +440,7 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
       try { cfg = await loadConfig(p.uid || null); }
       catch (e) { app.log.error('Config load failed: ' + e.message); cfg = await loadConfig(null); }
       if (!cfg.key) { app.log.error('No AI key for this call'); try { twilio.close(); } catch {} return; }
-      app.log.info(`Call started for ${cfg.uid || 'default line'} from ${from}`);
+      app.log.info(`Call started for ${cfg.uid || 'default line'} from ${from} (${cfg.provider || 'gemini'})`);
       if (cfg.uid && db) {
         try {
           callRef = await db.collection(`users/${cfg.uid}/calls`).add({
@@ -527,30 +449,38 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
           cfg.callRef = callRef;
         } catch (e) { app.log.error('Call log failed: ' + e.message); }
       }
-      openGemini();
-    } else if (msg.event === 'media') {
-      const frame = JSON.stringify({
-        realtimeInput: { audio: { data: twilioToGemini(msg.media.payload), mimeType: 'audio/pcm;rate=16000' } }
+      agent = openAgent(cfg, {
+        io: 'phone',
+        tools: !!cfg.uid,
+        system: buildSystem(cfg, from, 'call'),
+        greet: 'A caller just connected. Greet them warmly and ask how you can help.',
+        runTool: (name, args) => runTool(cfg, name, args, from),
+        onAudio: (b64) => { if (streamSid) twilio.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } })); },
+        onClear: () => { if (streamSid) twilio.send(JSON.stringify({ event: 'clear', streamSid })); },
+        onCaption: (who, text) => addLine(transcript, who === 'caller' ? 'Caller' : cfg.agentName, text),
+        onError: (m) => app.log.error('AI error: ' + m),
+        onClose: () => { try { twilio.close(); } catch {} }
       });
-      if (geminiReady && gemini && gemini.readyState === WebSocket.OPEN) gemini.send(frame);
-      else if (pending.length < 100) pending.push(frame);
+    } else if (msg.event === 'media') {
+      if (agent) agent.sendAudio(msg.media.payload);
     } else if (msg.event === 'stop') {
-      try { gemini && gemini.close(); } catch {}
+      if (agent) agent.close();
     }
   });
 
   twilio.on('close', async () => {
-    try { gemini && gemini.close(); } catch {}
+    if (agent) agent.close();
+    const durationSec = Math.round((Date.now() - startedAt) / 1000);
     if (callRef) {
       try {
         await callRef.update({
           endedAt: admin.firestore.FieldValue.serverTimestamp(),
-          durationSec: Math.round((Date.now() - startedAt) / 1000),
+          durationSec,
           status: 'completed'
         });
       } catch {}
     }
-    finishCall(cfg, callRef, transcript, from, Math.round((Date.now() - startedAt) / 1000)).catch(() => {});
+    finishCall(cfg, callRef, transcript, from, durationSec).catch(() => {});
   });
 });
 
@@ -726,10 +656,218 @@ app.post('/stripe/webhook', async (req, reply) => {
 });
 
 /* SOLANA_LIVE block */
-/* ---------------- summaries, alerts, test chat & test call ---------------- */
+/* AGENT_ADAPTERS */
+/* ---------------- AI voice: Gemini Live or OpenAI Realtime ---------------- */
 const SITE_URL = (process.env.SITE_URL || 'https://vocallus.netlify.app').replace(/\/$/, '');
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
+const OPENAI_VOICE = process.env.OPENAI_VOICE || 'marin';
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe';
+const OPENAI_TEXT_MODEL = process.env.OPENAI_TEXT_MODEL || 'gpt-4.1-mini';
 
+function lowerTypes(s) {
+  if (Array.isArray(s)) return s.map(lowerTypes);
+  if (!s || typeof s !== 'object') return s;
+  const o = {};
+  for (const k of Object.keys(s)) o[k] = (k === 'type' && typeof s[k] === 'string') ? s[k].toLowerCase() : lowerTypes(s[k]);
+  return o;
+}
+const OPENAI_TOOLS = TOOLS[0].functionDeclarations.map(f => ({
+  type: 'function', name: f.name, description: f.description, parameters: lowerTypes(f.parameters)
+}));
+
+// 16 kHz PCM16 (browser mic) -> 24 kHz PCM16 (OpenAI)
+function pcm16kTo24k(b64) {
+  const inp = Buffer.from(b64, 'base64');
+  const n = inp.length >> 1;
+  if (!n) return '';
+  const outN = Math.floor(n * 1.5);
+  const out = Buffer.alloc(outN * 2);
+  for (let i = 0; i < outN; i++) {
+    const pos = i / 1.5, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, n - 1), f = pos - i0;
+    const s0 = inp.readInt16LE(i0 * 2), s1 = inp.readInt16LE(i1 * 2);
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(s0 + (s1 - s0) * f))), i * 2);
+  }
+  return out.toString('base64');
+}
+
+// io: 'phone' (Twilio mu-law 8k in/out) or 'browser' (PCM 16k in, PCM 24k out)
+function openAgent(cfg, o) {
+  return (cfg.provider === 'openai' ? openaiAgent : geminiAgent)(cfg, o);
+}
+
+function geminiAgent(cfg, o) {
+  const ws = new WebSocket(GEMINI_URL + encodeURIComponent(cfg.key));
+  let ready = false, toolBusy = 0, closed = false;
+  const pending = [];
+  ws.on('open', () => {
+    const setup = {
+      model: `models/${MODEL}`,
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } }
+      },
+      systemInstruction: { parts: [{ text: o.system }] },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {}
+    };
+    if (o.tools) setup.tools = TOOLS;
+    ws.send(JSON.stringify({ setup }));
+  });
+  ws.on('message', async (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (msg.setupComplete) {
+      ready = true;
+      ws.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', parts: [{ text: o.greet }] }], turnComplete: true } }));
+      while (pending.length) ws.send(pending.shift());
+      if (o.onReady) o.onReady();
+      return;
+    }
+    if (msg.toolCall) {
+      // Hold the caller's audio while a tool runs - streaming audio mid tool call is what makes
+      // Gemini drop the session with "CONTENT_TYPE_AUDIO is not supported".
+      toolBusy++;
+      try {
+        const calls = msg.toolCall.functionCalls || [];
+        calls.forEach(c => o.onTool && o.onTool(c.name));
+        const functionResponses = await Promise.all(calls.map(async c => ({
+          id: c.id, name: c.name, response: await o.runTool(c.name, c.args || {})
+        })));
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ toolResponse: { functionResponses } }));
+      } finally { toolBusy--; }
+      return;
+    }
+    const sc = msg.serverContent;
+    if (!sc) {
+      if (msg.error && o.onError) o.onError(msg.error.message || JSON.stringify(msg.error));
+      return;
+    }
+    if (sc.interrupted && o.onClear) o.onClear();
+    if (sc.inputTranscription && sc.inputTranscription.text) o.onCaption && o.onCaption('caller', sc.inputTranscription.text);
+    if (sc.outputTranscription && sc.outputTranscription.text) o.onCaption && o.onCaption('agent', sc.outputTranscription.text);
+    for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
+      if (p.inlineData && p.inlineData.data) o.onAudio(o.io === 'phone' ? geminiToTwilio(p.inlineData.data) : p.inlineData.data);
+    }
+  });
+  ws.on('close', (code, reason) => {
+    if (closed) return;
+    closed = true;
+    app.log.info(`Gemini closed: ${code} ${reason ? reason.toString() : ''}`);
+    if (o.onClose) o.onClose(code, reason ? reason.toString() : '');
+  });
+  ws.on('error', (err) => app.log.error('Gemini socket error: ' + err.message));
+  return {
+    sendAudio(b64) {
+      if (toolBusy > 0) return;
+      const frame = JSON.stringify({ realtimeInput: { audio: {
+        data: o.io === 'phone' ? twilioToGemini(b64) : b64, mimeType: 'audio/pcm;rate=16000'
+      } } });
+      if (ready && ws.readyState === WebSocket.OPEN) ws.send(frame);
+      else if (pending.length < 100) pending.push(frame);
+    },
+    close() { closed = true; try { ws.close(); } catch {} }
+  };
+}
+
+function openaiAgent(cfg, o) {
+  const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
+    { headers: { Authorization: `Bearer ${cfg.key}` } });
+  let ready = false, toolBusy = 0, closed = false, greeted = false;
+  const pending = [];
+  const fmt = o.io === 'phone' ? { type: 'audio/pcmu' } : { type: 'audio/pcm', rate: 24000 };
+  const send = (obj) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
+  ws.on('open', () => {
+    send({ type: 'session.update', session: {
+      type: 'realtime',
+      model: OPENAI_REALTIME_MODEL,
+      instructions: o.system,
+      output_modalities: ['audio'],
+      audio: {
+        input: { format: fmt, transcription: { model: OPENAI_TRANSCRIBE_MODEL }, turn_detection: { type: 'server_vad' } },
+        output: { format: fmt, voice: OPENAI_VOICE }
+      },
+      tools: o.tools ? OPENAI_TOOLS : [],
+      tool_choice: 'auto'
+    } });
+  });
+  ws.on('message', async (data) => {
+    let ev;
+    try { ev = JSON.parse(data.toString()); } catch { return; }
+    switch (ev.type) {
+      case 'session.updated':
+        if (!greeted) {
+          greeted = true; ready = true;
+          send({ type: 'response.create', response: { instructions: o.greet } });
+          while (pending.length) ws.send(pending.shift());
+          if (o.onReady) o.onReady();
+        }
+        break;
+      case 'response.output_audio.delta':
+      case 'response.audio.delta':
+        if (ev.delta) o.onAudio(ev.delta);
+        break;
+      case 'input_audio_buffer.speech_started':
+        if (o.onClear) o.onClear();
+        break;
+      case 'response.output_audio_transcript.delta':
+      case 'response.audio_transcript.delta':
+        if (ev.delta && o.onCaption) o.onCaption('agent', ev.delta);
+        break;
+      case 'conversation.item.input_audio_transcription.completed':
+        if (ev.transcript && o.onCaption) o.onCaption('caller', ev.transcript + ' ');
+        break;
+      case 'response.done': {
+        const calls = ((ev.response && ev.response.output) || []).filter(it => it.type === 'function_call');
+        if (!calls.length) break;
+        toolBusy++;
+        try {
+          for (const c of calls) {
+            if (o.onTool) o.onTool(c.name);
+            let args = {};
+            try { args = JSON.parse(c.arguments || '{}'); } catch {}
+            const result = await o.runTool(c.name, args);
+            send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: c.call_id, output: JSON.stringify(result) } });
+          }
+          send({ type: 'response.create' });
+        } finally { toolBusy--; }
+        break;
+      }
+      case 'error': {
+        const m = (ev.error && ev.error.message) || 'OpenAI error';
+        app.log.error('OpenAI realtime: ' + m);
+        if (o.onError && !/no active response|cancel/i.test(m)) o.onError(m);
+        break;
+      }
+    }
+  });
+  ws.on('unexpected-response', (req, res) => {
+    try { req.destroy(); } catch {}
+    const m = res.statusCode === 401 ? 'Your OpenAI API key was rejected. Check it on the Solana page.' : `OpenAI error ${res.statusCode}`;
+    if (o.onError) o.onError(m);
+    if (!closed) { closed = true; if (o.onClose) o.onClose(4000 + (res.statusCode || 0), m); }
+  });
+  ws.on('close', (code, reason) => {
+    if (closed) return;
+    closed = true;
+    app.log.info(`OpenAI closed: ${code} ${reason ? reason.toString() : ''}`);
+    if (o.onClose) o.onClose(code, reason ? reason.toString() : '');
+  });
+  ws.on('error', (err) => app.log.error('OpenAI socket error: ' + err.message));
+  return {
+    sendAudio(b64) {
+      if (toolBusy > 0) return;
+      const audio = o.io === 'phone' ? b64 : pcm16kTo24k(b64);
+      if (!audio) return;
+      const frame = JSON.stringify({ type: 'input_audio_buffer.append', audio });
+      if (ready && ws.readyState === WebSocket.OPEN) ws.send(frame);
+      else if (pending.length < 100) pending.push(frame);
+    },
+    close() { closed = true; try { ws.close(); } catch {} }
+  };
+}
+
+/* ---------------- text: summaries + test chat (Gemini or OpenAI) ---------------- */
 const fmtNum = (n) => {
   let d = String(n || '').replace(/\D/g, '');
   if (d.length === 11 && d[0] === '1') d = d.slice(1);
@@ -742,6 +880,8 @@ function addLine(transcript, who, text) {
   else if (transcript.length < 400) transcript.push({ who, text });
 }
 const transcriptText = (t) => t.map(l => `${l.who}: ${l.text.trim()}`).join('\n');
+const keyError = (provider, m) => /api key|unauthori|401|invalid.*key/i.test(m)
+  ? `Your ${provider === 'openai' ? 'OpenAI' : 'Google'} API key was rejected. Check it on the Solana page.` : m;
 
 async function geminiText(key, system, contents, tools) {
   const body = { contents };
@@ -757,14 +897,61 @@ async function geminiText(key, system, contents, tools) {
 }
 const partsOf = (j) => (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
 
-async function summarize(key, transcript, agentName) {
+async function openaiChat(key, messages, tools) {
+  const body = { model: OPENAI_TEXT_MODEL, messages };
+  if (tools) body.tools = tools;
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body)
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((j.error && j.error.message) || `OpenAI error ${res.status}`);
+  return j.choices && j.choices[0] && j.choices[0].message || {};
+}
+
+// msgs: [{ role: 'user' | 'model', text }]. Runs calendar tools. Returns the reply text.
+async function chatReply(cfg, key, system, msgs, withTools) {
+  if (cfg.provider === 'openai') {
+    const messages = [{ role: 'system', content: system }]
+      .concat(msgs.map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text })));
+    const tools = withTools ? OPENAI_TOOLS.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } })) : undefined;
+    for (let i = 0; i < 5; i++) {
+      const m = await openaiChat(key, messages, tools);
+      if (!m.tool_calls || !m.tool_calls.length) return (m.content || '').trim();
+      messages.push(m);
+      for (const tc of m.tool_calls) {
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || '{}'); } catch {}
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(await runTool(cfg, tc.function.name, args, '')) });
+      }
+    }
+    return '';
+  }
+  const contents = msgs.map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.text }] }));
+  for (let i = 0; i < 5; i++) {
+    const j = await geminiText(key, system, contents, withTools ? TOOLS : undefined);
+    const parts = partsOf(j);
+    const calls = parts.filter(p => p.functionCall);
+    if (!calls.length) return parts.map(p => p.text || '').join('').trim();
+    contents.push({ role: 'model', parts });
+    const responses = [];
+    for (const p of calls) {
+      responses.push({ functionResponse: { name: p.functionCall.name, response: await runTool(cfg, p.functionCall.name, p.functionCall.args || {}, '') } });
+    }
+    contents.push({ role: 'user', parts: responses });
+  }
+  return '';
+}
+
+async function summarize(cfg, transcript) {
+  const key = cfg && (cfg.key || (cfg.provider !== 'openai' ? DEFAULT_KEY : null));
   if (!key || !transcript.length) return '';
   try {
-    const j = await geminiText(key,
+    return (await chatReply(cfg, key,
       'You write very short phone call summaries for a business owner. One or two plain sentences, no greeting, no markdown. ' +
       'Say who called (their name if given), what they wanted, and what happened (appointment booked, message taken, question answered).',
-      [{ role: 'user', parts: [{ text: `Call answered by ${agentName}:\n\n` + transcriptText(transcript).slice(0, 12000) }] }]);
-    return partsOf(j).map(p => p.text || '').join('').trim().slice(0, 600);
+      [{ role: 'user', text: `Call answered by ${cfg.agentName}:\n\n` + transcriptText(transcript).slice(0, 12000) }], false)).slice(0, 600);
   } catch (e) {
     app.log.error('Summary failed: ' + e.message);
     return '';
@@ -802,10 +989,9 @@ async function notifyOwner(uid, title, body, link) {
 
 const durText = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
-// Phone calls: summary + transcript on the call, then an alert.
 async function finishCall(cfg, callRef, transcript, from, durationSec) {
   if (!cfg || !cfg.uid) return;
-  const summary = await summarize(cfg.key, transcript, cfg.agentName);
+  const summary = await summarize(cfg, transcript);
   if (callRef) {
     try {
       await callRef.set({
@@ -846,6 +1032,11 @@ function demoBucket(uid) {
   if (!u || u.day !== day) { u = { day, chat: 0, sec: 0 }; demoUse.set(uid, u); }
   return u;
 }
+// Test chats/calls: the customer's own key if they saved one, otherwise yours (Gemini).
+function testCfg(cfg) {
+  if (cfg.key) return cfg;
+  return Object.assign({}, cfg, { provider: 'gemini', key: DEFAULT_KEY });
+}
 
 app.get('/api/config', async (req, reply) => {
   setCors(req, reply);
@@ -870,49 +1061,27 @@ app.post('/api/demo/chat', async (req, reply) => {
   if (b.chat >= (paid ? 500 : 150)) return reply.code(429).send({ error: "You've hit today's test limit. Try again tomorrow." });
   b.chat++;
 
-  const msgs = Array.isArray(req.body && req.body.messages) ? req.body.messages.slice(-30) : [];
+  const msgs = (Array.isArray(req.body && req.body.messages) ? req.body.messages.slice(-30) : [])
+    .map(m => ({ role: m.role === 'user' ? 'user' : 'model', text: String(m.text || '').slice(0, 2000) }));
   if (!msgs.length) return reply.code(400).send({ error: 'Type a message first.' });
   let cfg;
-  try { cfg = await loadConfig(user.uid); } catch (e) { return reply.code(500).send({ error: 'Could not load your settings.' }); }
-  const key = cfg.key || DEFAULT_KEY;
-  if (!key) return reply.code(500).send({ error: 'No AI key is set up.' });
-
-  const contents = msgs.map(m => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: String(m.text || '').slice(0, 2000) }]
-  }));
+  try { cfg = testCfg(await loadConfig(user.uid)); } catch (e) { return reply.code(500).send({ error: 'Could not load your settings.' }); }
+  if (!cfg.key) return reply.code(500).send({ error: 'No AI key is set up.' });
   try {
-    for (let i = 0; i < 5; i++) {
-      const j = await geminiText(key, buildSystem(cfg, '', 'chat'), contents, TOOLS);
-      const parts = partsOf(j);
-      const calls = parts.filter(p => p.functionCall);
-      if (!calls.length) {
-        const text = parts.map(p => p.text || '').join('').trim();
-        return { reply: text || 'Sorry, could you say that again?' };
-      }
-      contents.push({ role: 'model', parts });
-      const responses = [];
-      for (const p of calls) {
-        responses.push({ functionResponse: {
-          name: p.functionCall.name,
-          response: await runTool(cfg, p.functionCall.name, p.functionCall.args || {}, '')
-        } });
-      }
-      contents.push({ role: 'user', parts: responses });
-    }
-    return { reply: 'Sorry, could you say that again?' };
+    const text = await chatReply(cfg, cfg.key, buildSystem(cfg, '', 'chat'), msgs, true);
+    return { reply: text || 'Sorry, could you say that again?' };
   } catch (e) {
     app.log.error('Test chat: ' + e.message);
-    return reply.code(502).send({ error: /API key/i.test(e.message) ? 'Your Gemini API key was rejected. Check it on the Solana page.' : e.message });
+    return reply.code(502).send({ error: keyError(cfg.provider, e.message) });
   }
 });
 
-// Browser test call: mic audio (16 kHz PCM) in, Solana's voice (24 kHz PCM) out.
+// Browser test call: mic audio (16 kHz PCM) in, voice (24 kHz PCM) out.
 app.get('/demo-call', { websocket: true }, (sock, req) => {
   const origin = req.headers.origin;
   if (origin && !ALLOWED_ORIGINS.includes(origin)) { try { sock.close(1008, 'origin not allowed'); } catch {} return; }
 
-  let gemini = null, ready = false, cfg = null, uid = null, started = 0, timer = null, closed = false;
+  let agent = null, live = false, cfg = null, uid = null, started = 0, timer = null, closed = false;
   const transcript = [];
   const send = (o) => { try { if (sock.readyState === 1) sock.send(JSON.stringify(o)); } catch {} };
 
@@ -920,14 +1089,14 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
     if (closed) return;
     closed = true;
     clearTimeout(timer);
-    try { gemini && gemini.close(); } catch {}
+    if (agent) agent.close();
     send({ type: 'ended', reason });
     try { sock.close(); } catch {}
     const secs = started ? Math.round((Date.now() - started) / 1000) : 0;
     if (uid) demoBucket(uid).sec += secs;
     if (cfg && cfg.uid && transcript.length) {
       (async () => {
-        const summary = await summarize(cfg.key || DEFAULT_KEY, transcript, cfg.agentName);
+        const summary = await summarize(cfg, transcript);
         await notifyOwner(cfg.uid, `${cfg.agentName} · test call`, summary || `Test call ended after ${durText(secs)}.`);
       })().catch(() => {});
     }
@@ -941,7 +1110,7 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
       try {
         const decoded = await admin.auth().verifyIdToken(String(m.token || ''));
         uid = decoded.uid;
-        cfg = await loadConfig(uid);
+        cfg = testCfg(await loadConfig(uid));
       } catch (e) {
         send({ type: 'error', error: 'Please sign in again.' });
         return end('auth');
@@ -949,74 +1118,40 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
       const paid = ['pro', 'max'].includes(cfg.plan);
       const left = (paid ? 3600 : 900) - demoBucket(uid).sec;
       if (left <= 10) { send({ type: 'error', error: "You've used today's test call time. Try again tomorrow." }); return end('limit'); }
-      const key = cfg.key || DEFAULT_KEY;
-      if (!key) { send({ type: 'error', error: 'No AI key is set up.' }); return end('nokey'); }
+      if (!cfg.key) { send({ type: 'error', error: 'No AI key is set up.' }); return end('nokey'); }
 
-      gemini = new WebSocket(GEMINI_URL + encodeURIComponent(key));
-      gemini.on('open', () => {
-        const setup = {
-          model: `models/${MODEL}`,
-          generationConfig: {
-            responseModalities: ['AUDIO'],
-            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } }
-          },
-          systemInstruction: { parts: [{ text: buildSystem(cfg, '', 'call') }] },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          tools: TOOLS
-        };
-        gemini.send(JSON.stringify({ setup }));
-      });
-      gemini.on('message', async (data) => {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch { return; }
-        if (msg.setupComplete) {
-          ready = true;
+      agent = openAgent(cfg, {
+        io: 'browser',
+        tools: true,
+        system: buildSystem(cfg, '', 'call'),
+        greet: 'A caller just connected. Greet them warmly and ask how you can help.',
+        runTool: (name, args) => runTool(cfg, name, args, ''),
+        onReady: () => {
+          live = true;
           started = Date.now();
           timer = setTimeout(() => end('limit'), Math.min(300, left) * 1000);
-          gemini.send(JSON.stringify({ clientContent: {
-            turns: [{ role: 'user', parts: [{ text: 'A caller just connected. Greet them warmly and ask how you can help.' }] }],
-            turnComplete: true
-          } }));
           send({ type: 'live', maxSec: Math.min(300, left), agentName: cfg.agentName });
-          return;
-        }
-        if (msg.toolCall) {
-          const calls = msg.toolCall.functionCalls || [];
-          calls.forEach(c => send({ type: 'tool', name: c.name }));
-          const functionResponses = await Promise.all(calls.map(async c => ({
-            id: c.id, name: c.name, response: await runTool(cfg, c.name, c.args || {}, '')
-          })));
-          if (gemini.readyState === WebSocket.OPEN) gemini.send(JSON.stringify({ toolResponse: { functionResponses } }));
-          return;
-        }
-        const sc = msg.serverContent;
-        if (!sc) {
-          if (msg.error) send({ type: 'error', error: msg.error.message || 'AI error' });
-          return;
-        }
-        if (sc.interrupted) send({ type: 'clear' });
-        if (sc.inputTranscription && sc.inputTranscription.text) {
-          addLine(transcript, 'Caller', sc.inputTranscription.text);
-          send({ type: 'caption', who: 'you', text: sc.inputTranscription.text });
-        }
-        if (sc.outputTranscription && sc.outputTranscription.text) {
-          addLine(transcript, cfg.agentName, sc.outputTranscription.text);
-          send({ type: 'caption', who: 'agent', text: sc.outputTranscription.text });
-        }
-        for (const p of (sc.modelTurn && sc.modelTurn.parts) || []) {
-          if (p.inlineData && p.inlineData.data) send({ type: 'audio', data: p.inlineData.data });
+        },
+        onAudio: (b64) => send({ type: 'audio', data: b64 }),
+        onClear: () => send({ type: 'clear' }),
+        onTool: (name) => send({ type: 'tool', name }),
+        onCaption: (who, text) => {
+          addLine(transcript, who === 'caller' ? 'Caller' : cfg.agentName, text);
+          send({ type: 'caption', who: who === 'caller' ? 'you' : 'agent', text });
+        },
+        onError: (msg) => send({ type: 'error', error: keyError(cfg.provider, msg) }),
+        onClose: (code, why) => {
+          if (closed) return;
+          if (code !== 1000) {
+            send({ type: 'error', error: code === 1007
+              ? 'The AI connection dropped. Press Call again to keep testing.'
+              : keyError(cfg.provider, why || 'The AI connection closed.') });
+          }
+          end('ai');
         }
       });
-      gemini.on('close', (code, reason) => {
-        if (closed) return;
-        const why = reason ? reason.toString() : '';
-        if (code !== 1000) send({ type: 'error', error: /API key/i.test(why) ? 'Your Gemini API key was rejected. Check it on the Solana page.' : (why || 'The AI connection closed.') });
-        end('ai');
-      });
-      gemini.on('error', (err) => app.log.error('Test call socket error: ' + err.message));
-    } else if (m.type === 'audio' && ready && gemini && gemini.readyState === WebSocket.OPEN && typeof m.data === 'string') {
-      gemini.send(JSON.stringify({ realtimeInput: { audio: { data: m.data, mimeType: 'audio/pcm;rate=16000' } } }));
+    } else if (m.type === 'audio' && live && agent && typeof m.data === 'string') {
+      agent.sendAudio(m.data);
     } else if (m.type === 'stop') {
       end('user');
     }
