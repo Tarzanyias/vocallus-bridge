@@ -1419,5 +1419,46 @@ app.post('/api/billing/subscribe', async (req, reply) => {
   }
 });
 
+/* ---------------- delete account ---------------- */
+app.post('/api/account/delete', async (req, reply) => {
+  const user = await requireUser(req, reply);
+  if (!user) return reply;
+  if (!req.body || req.body.confirm !== 'DELETE') return reply.code(400).send({ error: 'Type DELETE to confirm.' });
+  const d = user.data || {};
+
+  // 1. Stop billing first - if this fails, nothing else is touched.
+  try {
+    if (typeof stripe !== 'undefined' && stripe && d.stripeCustomerId) {
+      const subs = await stripe.subscriptions.list({ customer: d.stripeCustomerId, status: 'all', limit: 20 });
+      for (const s of subs.data) {
+        if (!['canceled', 'incomplete_expired'].includes(s.status)) await stripe.subscriptions.cancel(s.id);
+      }
+    }
+  } catch (e) {
+    app.log.error('Delete account (Stripe): ' + e.message);
+    return reply.code(502).send({ error: "Couldn't cancel your subscription, so nothing was deleted. Please try again." });
+  }
+
+  // 2. Release a number Vocallus bought for them.
+  if (d.twilioNumberSid && d.numberSource === 'purchased') {
+    try { await twilioApi(`/IncomingPhoneNumbers/${d.twilioNumberSid}.json`, { method: 'DELETE' }); }
+    catch (e) { app.log.error('Delete account (Twilio): ' + e.message); }
+  }
+
+  // 3. All their data (user doc + calls, appointments, private keys, push tokens).
+  try { await db.recursiveDelete(db.doc(`users/${user.uid}`)); }
+  catch (e) {
+    app.log.error('Delete account (data): ' + e.message);
+    return reply.code(500).send({ error: "Your subscription was cancelled but your data couldn't be deleted. Please try again." });
+  }
+
+  // 4. Their login.
+  try { await admin.auth().deleteUser(user.uid); }
+  catch (e) { app.log.error('Delete account (auth): ' + e.message); }
+
+  app.log.info(`Deleted account ${user.uid}`);
+  return { deleted: true };
+});
+
 const port = process.env.PORT || 8080;
 await app.listen({ port, host: '0.0.0.0' });
