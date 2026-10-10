@@ -662,6 +662,16 @@ app.post('/stripe/webhook', async (req, reply) => {
         }, { merge: true });
         app.log.info(`Plan ${plan} activated for ${uid}`);
       }
+    } else if ((evt.type === 'customer.subscription.created' || evt.type === 'customer.subscription.updated') &&
+               ['active', 'trialing'].includes(obj.status) && obj.metadata && obj.metadata.uid) {
+      const plan = obj.metadata.plan === 'max' ? 'max' : 'pro';
+      await db.doc(`users/${obj.metadata.uid}`).set({
+        plan,
+        stripeCustomerId: obj.customer || null,
+        stripeSubscriptionId: obj.id,
+        planUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      app.log.info(`Plan ${plan} active for ${obj.metadata.uid}`);
     } else if (evt.type === 'customer.subscription.deleted' ||
               (evt.type === 'customer.subscription.updated' &&
                ['canceled', 'unpaid', 'incomplete_expired'].includes(obj.status))) {
@@ -1344,6 +1354,69 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
   });
   sock.on('close', () => end('closed'));
   sock.on('error', () => end('error'));
+});
+
+/* ---------------- Stripe on-site checkout ---------------- */
+import Stripe from 'stripe';
+
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const PRICE_IDS = { pro: process.env.STRIPE_PRICE_PRO, max: process.env.STRIPE_PRICE_MAX };
+
+app.post('/api/billing/subscribe', async (req, reply) => {
+  const user = await requireUser(req, reply);
+  if (!user) return reply;
+  if (!stripe) return reply.code(500).send({ error: 'Billing is not set up yet.' });
+
+  const want = req.body && req.body.plan;
+  const plan = want === 'max' ? 'max' : want === 'pro' ? 'pro' : null;
+  if (!plan || !PRICE_IDS[plan]) return reply.code(400).send({ error: 'Unknown plan.' });
+  if (user.data.plan === plan) return reply.code(409).send({ error: `You're already on ${plan === 'max' ? 'Max' : 'Pro'}.` });
+
+  try {
+    let customerId = user.data.stripeCustomerId;
+    if (!customerId) {
+      const authUser = await admin.auth().getUser(user.uid);
+      const c = await stripe.customers.create({
+        email: authUser.email || undefined,
+        name: user.data.name || authUser.displayName || undefined,
+        metadata: { uid: user.uid }
+      });
+      customerId = c.id;
+      await db.doc(`users/${user.uid}`).set({ stripeCustomerId: customerId }, { merge: true });
+    }
+
+    // Already paying -> switch plan on the existing subscription.
+    const active = await stripe.subscriptions.list({ customer: customerId, status: 'active', limit: 1 });
+    if (active.data.length) {
+      const sub = active.data[0];
+      await stripe.subscriptions.update(sub.id, {
+        items: [{ id: sub.items.data[0].id, price: PRICE_IDS[plan] }],
+        proration_behavior: 'create_prorations',
+        metadata: { uid: user.uid, plan }
+      });
+      return { updated: true, plan };
+    }
+
+    // Clean up checkout attempts that were never paid.
+    const stale = await stripe.subscriptions.list({ customer: customerId, status: 'incomplete', limit: 10 });
+    for (const s of stale.data) { try { await stripe.subscriptions.cancel(s.id); } catch {} }
+
+    const sub = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: PRICE_IDS[plan] }],
+      payment_behavior: 'default_incomplete',
+      payment_settings: { save_default_payment_method: 'on_subscription' },
+      metadata: { uid: user.uid, plan },
+      expand: ['latest_invoice.confirmation_secret']
+    });
+    const inv = sub.latest_invoice;
+    const clientSecret = inv && inv.confirmation_secret && inv.confirmation_secret.client_secret;
+    if (!clientSecret) return reply.code(500).send({ error: 'Could not start checkout.' });
+    return { clientSecret, subscriptionId: sub.id, plan };
+  } catch (e) {
+    app.log.error('Billing: ' + e.message);
+    return reply.code(502).send({ error: e.message });
+  }
 });
 
 const port = process.env.PORT || 8080;

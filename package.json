@@ -12,6 +12,7 @@
     "dotenv": "^16.4.0",
     "fastify": "^4.28.0",
     "firebase-admin": "^13.10.0",
+    "stripe": "^18.5.0",
     "ws": "^8.18.0"
   },
   "engines": {
