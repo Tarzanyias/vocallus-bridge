@@ -1335,6 +1335,7 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
   if (origin && !ALLOWED_ORIGINS.includes(origin)) { try { sock.close(1008, 'origin not allowed'); } catch {} return; }
 
   let agent = null, live = false, cfg = null, uid = null, started = 0, timer = null, closed = false;
+  let switching = false, hooks = null;   /* DEMO_VOICE_SWITCH */
   const transcript = [];
   const send = (o) => { try { if (sock.readyState === 1) sock.send(JSON.stringify(o)); } catch {} };
 
@@ -1373,28 +1374,26 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
       if (left <= 10) { send({ type: 'error', error: "You've used today's test call time. Try again tomorrow." }); return end('limit'); }
       if (!cfg.key) { send({ type: 'error', error: 'No AI key is set up.' }); return end('nokey'); }
 
-      agent = openAgent(cfg, {
+      // Callbacks only act for the session that is currently live (a voice switch starts a second one).
+      hooks = (box) => ({
         io: 'browser',
         tools: true,
-        system: buildSystem(cfg, '', 'call'),
-        greet: 'A caller just connected. Greet them warmly and ask how you can help.',
         runTool: (name, args) => runTool(cfg, name, args, ''),
-        onReady: () => {
-          live = true;
-          started = Date.now();
-          timer = setTimeout(() => end('limit'), Math.min(300, left) * 1000);
-          send({ type: 'live', maxSec: Math.min(300, left), agentName: cfg.agentName });
-        },
-        onAudio: (b64) => send({ type: 'audio', data: b64 }),
-        onClear: () => send({ type: 'clear' }),
+        onAudio: (b64) => { if (agent === box.ref) send({ type: 'audio', data: b64 }); },
+        onClear: () => { if (agent === box.ref) send({ type: 'clear' }); },
         onTool: (name) => send({ type: 'tool', name }),
         onCaption: (who, text) => {
+          if (agent !== box.ref) return;
           addLine(transcript, who === 'caller' ? 'Caller' : cfg.agentName, text);
           send({ type: 'caption', who: who === 'caller' ? 'you' : 'agent', text });
         },
-        onError: (msg) => send({ type: 'error', error: keyError(cfg.provider, msg) }),
+        onError: (msg) => { if (agent === box.ref) send({ type: 'error', error: keyError(cfg.provider, msg) }); },
         onClose: (code, why) => {
           if (closed) return;
+          if (agent !== box.ref) {                       // a voice switch that never got going
+            if (box.onFail) box.onFail();
+            return;
+          }
           if (code !== 1000) {
             send({ type: 'error', error: code === 1007
               ? 'The AI connection dropped. Press Call again to keep testing.'
@@ -1403,6 +1402,53 @@ app.get('/demo-call', { websocket: true }, (sock, req) => {
           end('ai');
         }
       });
+      const first = {};
+      first.ref = agent = openAgent(cfg, Object.assign(hooks(first), {
+        system: buildSystem(cfg, '', 'call'),
+        greet: 'A caller just connected. Greet them warmly and ask how you can help.',
+        onReady: () => {
+          live = true;
+          started = Date.now();
+          timer = setTimeout(() => end('limit'), Math.min(300, left) * 1000);
+          send({ type: 'live', maxSec: Math.min(300, left), agentName: cfg.agentName });
+        }
+      }));
+    } else if (m.type === 'voice' && live && agent && cfg && hooks && !closed) {
+      // Switch voice mid-call: start a new session in the new voice, then hand over.
+      const want = String(m.voice || '');
+      const allowed = want === 'default' || (['pro', 'max'].includes(cfg.plan) && ['female', 'male'].includes(want));
+      if (!allowed || want === cfg.voice || switching) return send({ type: 'switched', voice: cfg.voice, same: true });
+      switching = true;
+      const oldVoice = cfg.voice, oldName = cfg.agentName;
+      cfg.voice = want;
+      if (m.agentName) cfg.agentName = String(m.agentName).slice(0, 40);
+      const box = {};
+      let done = false;
+      const fail = () => {
+        if (done) return;
+        done = true; switching = false;
+        cfg.voice = oldVoice; cfg.agentName = oldName;
+        try { box.ref && box.ref.close(); } catch {}
+        send({ type: 'switched', voice: oldVoice, failed: true });
+      };
+      box.onFail = fail;
+      const guard = setTimeout(fail, 12000);
+      const sofar = transcriptText(transcript).slice(-6000);
+      box.ref = openAgent(cfg, Object.assign(hooks(box), {
+        system: buildSystem(cfg, '', 'call') +
+          '\n\nThis call is already in progress. The conversation so far:\n' + (sofar || '(nothing yet)') +
+          '\n\nContinue from where it left off. Do not greet the caller again or repeat yourself.',
+        greet: 'The caller just switched you to a new voice. Say one short, natural sentence in your new voice ' +
+          '(for example "Here is my new voice, how does this sound?"), then continue helping from where you left off.',
+        onReady: () => {
+          if (done) { try { box.ref.close(); } catch {} return; }
+          done = true; switching = false; clearTimeout(guard);
+          const old = agent;
+          agent = box.ref;
+          try { old.close(); } catch {}
+          send({ type: 'switched', voice: want, agentName: cfg.agentName });
+        }
+      }));
     } else if (m.type === 'audio' && live && agent && typeof m.data === 'string') {
       agent.sendAudio(m.data);
     } else if (m.type === 'stop') {
