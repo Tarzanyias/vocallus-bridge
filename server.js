@@ -885,7 +885,7 @@ app.get('/api/agent/status', async (req, reply) => {
 });
 
 function geminiAgentOnce(cfg, o, model) {
-  const ws = new WebSocket(GEMINI_URL + encodeURIComponent(cfg.key));
+  /* KEY_HEADER */ const ws = new WebSocket(GEMINI_URL.replace(/\?key=$/, ''), { headers: { 'x-goog-api-key': cfg.key } });
   let ready = false, toolBusy = 0, closed = false;
   const pending = [];
   ws.on('open', () => {
@@ -1132,8 +1132,8 @@ async function geminiTextOnce(key, system, contents, tools, model) {
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   if (tools) body.tools = tools;
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, /* KEY_HEADER_TEXT */
+    { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) }
   );
   const j = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((j.error && j.error.message) || `Gemini error ${res.status}`);
