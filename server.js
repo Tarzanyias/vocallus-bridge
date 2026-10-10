@@ -762,32 +762,91 @@ function elevenStream(voiceId, fmt, onAudio, onDone) {
 }
 
 // Mute the AI's own voice and speak its words with ElevenLabs instead.
+// If ElevenLabs fails (bad key, voice not in your account...), the call falls back to the AI's own voice.
 function withEleven(o, voiceId) {
   const fmt = o.io === 'phone' ? 'ulaw_8000' : 'pcm_24000';
-  let tts = null;
+  let tts = null, broken = false, held = [];
+  const giveUp = (why) => {
+    if (broken) return;
+    broken = true;
+    app.log.error(`ElevenLabs gave no audio (${why}) - using the default voice for the rest of this call`);
+    const backlog = held; held = [];
+    backlog.forEach(b => o.onAudio(b));
+  };
   const current = () => {
     if (!tts) {
-      const inst = elevenStream(voiceId, fmt, (b64) => o.onAudio(b64), () => { if (tts === inst) tts = null; });
+      const inst = elevenStream(voiceId, fmt, (b64) => {
+        inst.gotAudio = true; held = [];
+        o.onAudio(b64);
+      }, () => {
+        if (tts === inst) tts = null;
+        if (inst.pushed && !inst.gotAudio && !inst.cancelled) giveUp('stream closed');
+      });
       tts = inst;
     }
     return tts;
   };
   return Object.assign({}, o, {
-    onAudio: () => {},
+    onAudio: (b64) => {
+      if (broken) return o.onAudio(b64);
+      if (held.length < 3000) held.push(b64);       // kept in case ElevenLabs fails this turn
+    },
     onCaption: (who, text) => {
       if (o.onCaption) o.onCaption(who, text);
-      if (who === 'agent' && text) current().push(text);
+      if (!broken && who === 'agent' && text && text.trim()) { const t = current(); t.pushed = true; t.push(text); }
+      else if (!broken && who === 'agent' && text && tts) tts.push(text);
     },
     onTurnEnd: () => { if (tts) { tts.end(); tts = null; } if (o.onTurnEnd) o.onTurnEnd(); },
-    onClear: () => { if (tts) { tts.cancel(); tts = null; } if (o.onClear) o.onClear(); }
+    onClear: () => {
+      held = [];
+      if (tts) { tts.cancelled = true; tts.cancel(); tts = null; }
+      if (o.onClear) o.onClear();
+    }
   });
 }
 
 function openAgent(cfg, o) {
   const elevenId = ELEVEN_VOICES[cfg.voice];
-  if (elevenId && ELEVEN_KEY) o = withEleven(o, elevenId);
+  const useEleven = !!(elevenId && ELEVEN_KEY);
+  app.log.info(`Agent for ${cfg.uid || 'default line'}: ${cfg.provider || 'gemini'}, voice=${cfg.voice || 'default'}` +
+    (useEleven ? ' (ElevenLabs)' : (elevenId ? ' (ELEVENLABS_API_KEY missing - default voice)' : '')));
+  if (useEleven) o = withEleven(o, elevenId);
   return (cfg.provider === 'openai' ? openaiAgent : geminiAgent)(cfg, o);
 }
+
+// What the server will actually use for this account - shown on the Solana page.
+app.get('/api/agent/status', async (req, reply) => {
+  const user = await requireUser(req, reply);
+  if (!user) return reply;
+  let cfg;
+  try { cfg = await loadConfig(user.uid); } catch (e) { return reply.code(500).send({ error: 'Could not load your settings.' }); }
+  const out = {
+    plan: user.data.plan || 'none',
+    phoneNumber: user.data.phoneNumber || '',
+    provider: cfg.provider || 'gemini',
+    aiReady: !!cfg.key,
+    savedVoice: user.data.voice || 'default',
+    voice: cfg.voice || 'default',
+    engine: cfg.provider === 'openai' ? 'openai' : 'gemini',
+    problem: ''
+  };
+  const eid = ELEVEN_VOICES[out.voice];
+  if (eid) {
+    out.engine = 'elevenlabs';
+    if (!ELEVEN_KEY) out.problem = 'eleven-missing';
+    else {
+      try {
+        const r = await fetch(`https://api.elevenlabs.io/v1/voices/${eid}`, { headers: { 'xi-api-key': ELEVEN_KEY } });
+        if (!r.ok) {
+          const body = await r.text().catch(() => '');
+          if (/missing_permissions/i.test(body)) out.problem = '';            // key can't read voices; can't check
+          else out.problem = r.status === 401 ? 'eleven-key' : 'eleven-voice';
+        }
+      } catch { out.problem = 'eleven-unreachable'; }
+    }
+  }
+  return out;
+});
 
 function geminiAgent(cfg, o) {
   const ws = new WebSocket(GEMINI_URL + encodeURIComponent(cfg.key));
