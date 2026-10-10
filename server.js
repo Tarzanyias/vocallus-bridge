@@ -512,9 +512,12 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
 
 /* ---------------- dashboard API: phone numbers ---------------- */
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  'https://vocallus.netlify.app,http://localhost:8080,http://127.0.0.1:5500')
-  .split(',').map(s => s.trim());
+/* SITE_DOMAINS */
+const ALLOWED_ORIGINS = [...new Set([
+  'https://vocallus.com', 'https://www.vocallus.com', 'https://vocallus.netlify.app',
+  'http://localhost:8080', 'http://127.0.0.1:5500',
+  ...String(process.env.ALLOWED_ORIGINS || '').split(',')
+].map(s => s.trim().replace(/\/+$/, '')).filter(Boolean))];
 const TW_SID = process.env.TWILIO_ACCOUNT_SID;
 const TW_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
@@ -694,7 +697,7 @@ app.post('/stripe/webhook', async (req, reply) => {
 /* SOLANA_LIVE block */
 /* AGENT_ADAPTERS */
 /* ---------------- AI voice: Gemini Live or OpenAI Realtime ---------------- */
-const SITE_URL = (process.env.SITE_URL || 'https://vocallus.netlify.app').replace(/\/$/, '');
+const SITE_URL = (process.env.SITE_URL || 'https://vocallus.com').replace(/\/$/, '');
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const OPENAI_VOICE = process.env.OPENAI_VOICE || 'marin';
@@ -881,13 +884,13 @@ app.get('/api/agent/status', async (req, reply) => {
   return out;
 });
 
-function geminiAgent(cfg, o) {
+function geminiAgentOnce(cfg, o, model) {
   const ws = new WebSocket(GEMINI_URL + encodeURIComponent(cfg.key));
   let ready = false, toolBusy = 0, closed = false;
   const pending = [];
   ws.on('open', () => {
     const setup = {
-      model: `models/${MODEL}`,
+      model: `models/${model}`,
       generationConfig: {
         responseModalities: ['AUDIO'],
         speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: GEMINI_VOICES[cfg.voice] || VOICE } } }
@@ -953,6 +956,46 @@ function geminiAgent(cfg, o) {
       else if (pending.length < 100) pending.push(frame);
     },
     close() { closed = true; try { ws.close(); } catch {} }
+  };
+}
+
+/* LIVE_FALLBACK */
+// Try the usual Gemini Live model; if Google refuses it before the call starts, try the next one.
+const LIVE_MODELS = [...new Set([MODEL, 'gemini-3.8-live', 'gemini-2.5-flash-native-audio-preview-12-2025'].filter(Boolean))];
+let liveGood = null;
+function geminiAgent(cfg, o) {
+  const order = liveGood ? [liveGood, ...LIVE_MODELS.filter(m => m !== liveGood)] : LIVE_MODELS;
+  let i = 0, cur = null, stopped = false, isReady = false;
+  const buf = [];
+  const start = () => {
+    const model = order[i];
+    cur = geminiAgentOnce(cfg, Object.assign({}, o, {
+      onReady: () => {
+        isReady = true;
+        if (liveGood !== model) app.log.info('Gemini Live model in use: ' + model);
+        liveGood = model;
+        while (buf.length) cur.sendAudio(buf.shift());
+        if (o.onReady) o.onReady();
+      },
+      onError: (m) => {
+        if (isReady || i >= order.length - 1) { if (o.onError) o.onError(m); }
+        else app.log.error(`Gemini ${model}: ${m}`);
+      },
+      onClose: (code, why) => {
+        if (!stopped && !isReady && i < order.length - 1 && !/quota|billing|api key|unauthori|permission/i.test(why || '')) {
+          app.log.error(`Gemini model ${model} refused (${code} ${why || ''}) - trying ${order[i + 1]}`);
+          i++;
+          return start();
+        }
+        if (!isReady) app.log.error(`Gemini Live failed (${code} ${why || ''})`);
+        if (o.onClose) o.onClose(code, why);
+      }
+    }), model);
+  };
+  start();
+  return {
+    sendAudio(b64) { if (isReady) cur.sendAudio(b64); else if (buf.length < 100) buf.push(b64); },
+    close() { stopped = true; if (cur) cur.close(); }
   };
 }
 
@@ -1067,15 +1110,29 @@ function addLine(transcript, who, text) {
   else if (transcript.length < 400) transcript.push({ who, text });
 }
 const transcriptText = (t) => t.map(l => `${l.who}: ${l.text.trim()}`).join('\n');
+/* KEY_ERRORS */
 const keyError = (provider, m) => /api key|unauthori|401|invalid.*key/i.test(m)
-  ? `Your ${provider === 'openai' ? 'OpenAI' : 'Google'} API key was rejected. Check it on the Solana page.` : m;
+  ? `Your ${provider === 'openai' ? 'OpenAI' : 'Google'} API key was rejected. Check it on the Solana page.`
+  : /quota|billing|exceeded|429|RESOURCE_EXHAUSTED/i.test(m)
+  ? `The ${provider === 'openai' ? 'OpenAI' : 'Google AI'} key is out of quota or needs billing turned on.` : m;
 
+/* TEXT_FALLBACK */
+let textGood = null;
 async function geminiText(key, system, contents, tools) {
+  const order = [...new Set([textGood, TEXT_MODEL, 'gemini-3.8-flash'].filter(Boolean))];
+  let last = null;
+  for (const model of order) {
+    try { const j = await geminiTextOnce(key, system, contents, tools, model); textGood = model; return j; }
+    catch (e) { last = e; if (!/not found|not supported|no longer available|404/i.test(e.message)) throw e; }
+  }
+  throw last;
+}
+async function geminiTextOnce(key, system, contents, tools, model) {
   const body = { contents };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   if (tools) body.tools = tools;
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${encodeURIComponent(key)}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
   );
   const j = await res.json().catch(() => ({}));
