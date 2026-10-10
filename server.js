@@ -75,6 +75,7 @@ async function loadConfig(uid) {
     hours: u.hours || DEFAULT_HOURS,
     len: Number(u.appointmentLength) || 30,
     business: u.company || '',
+    about: String(u.businessDescription || '').slice(0, 1500),
     afterHours: ['message', 'book', 'forward', 'closed'].includes(u.afterHours) ? u.afterHours : 'message',
     afterHoursMessage: String(u.afterHoursMessage || '').slice(0, 400),
     afterHoursForward: /^\+1\d{10}$/.test(u.afterHoursForward || '') ? u.afterHoursForward : ''
@@ -202,6 +203,7 @@ async function logQuickCall(uid, from, status) {
 
 /* ---------------- calendar ---------------- */
 
+const BOOKING_LEAD_MIN = Math.max(0, Number(process.env.BOOKING_LEAD_MINUTES || 30));
 async function freeSlots(cfg, dateStr) {
   const h = cfg.hours[dayKey(dateStr)];
   if (!h || h.closed) return { closed: true, slots: [] };
@@ -217,7 +219,7 @@ async function freeSlots(cfg, dateStr) {
     return [s, e];
   });
 
-  const now = Date.now();
+  const now = Date.now() + BOOKING_LEAD_MIN * 60000;   // never in the past, never too soon
   const slots = [];
   for (let t = toMin(h.open); t + cfg.len <= toMin(h.close); t += cfg.len) {
     const s = zonedToUtc(dateStr, fromMin(t), cfg.tz).getTime();
@@ -271,12 +273,32 @@ const TOOLS = [{
   ]
 }];
 
+/* HISTORY_ACTIONS */
 async function runTool(cfg, name, args, callerPhone) {
+  const result = await runToolInner(cfg, name, args, callerPhone);
+  if (cfg && cfg.callRef) {
+    const a = { type: name, at: admin.firestore.Timestamp.now() };
+    if (name === 'check_availability') {
+      a.date = String(args.date || '');
+      a.open = !!(result && result.open);
+      a.times = (result && result.available_times) ? result.available_times.length : 0;
+    } else if (name === 'book_appointment') {
+      a.date = String(args.date || ''); a.time = (result && result.time) || String(args.time || '');
+      a.name = String(args.customer_name || '').slice(0, 100); a.reason = String(args.reason || '').slice(0, 200);
+      a.ok = !!(result && result.booked);
+    } else if (name === 'take_message') {
+      a.name = String(args.caller_name || '').slice(0, 100); a.ok = !!(result && result.saved);
+    }
+    cfg.callRef.set({ actions: admin.firestore.FieldValue.arrayUnion(a) }, { merge: true }).catch(() => {});
+  }
+  return result;
+}
+async function runToolInner(cfg, name, args, callerPhone) {
   try {
     if (name === 'check_availability') {
       const r = await freeSlots(cfg, args.date);
       if (r.closed) return { date: args.date, open: false, message: 'The business is closed that day.' };
-      if (!r.slots.length) return { date: args.date, open: true, available_times: [], message: 'Fully booked that day.' };
+      if (!r.slots.length) return { date: args.date, open: true, available_times: [], message: 'No open times left that day (it may already be over, or fully booked). Offer another day.' };
       return { date: args.date, open: true, available_times: r.slots.slice(0, 16).map(to12) };
     }
     if (name === 'book_appointment') {
@@ -295,6 +317,7 @@ async function runTool(cfg, name, args, callerPhone) {
         end: admin.firestore.Timestamp.fromDate(end),
         notes: args.reason || '',
         source: 'ai',
+        callId: cfg.callRef ? cfg.callRef.id : null,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       app.log.info(`Booked ${args.date} ${time} for ${args.customer_name} (user ${cfg.uid})`);
@@ -1174,7 +1197,16 @@ function buildSystem(cfg, from, channel) {
     s += ' To book: ask what day they want, call check_availability for that date, offer a few of the returned times,' +
       ' get their name, confirm the date and time back to them, then call book_appointment. Never invent open times.' +
       ' Say times in 12-hour format like 2:30 PM.';
+    s += ' Before booking, always spell the caller\'s name back letter by letter, for example "So that is R-A-Y-A-A-N, is that right?".'
+      + ' If they say no, ask them to spell it and spell it back again until they say yes.'
+      + ' Then repeat the day, date and time and only call book_appointment after they clearly say yes.'
+      + ' Never book a time in the past or a time check_availability did not return.';
   }
+  if (cfg.about) {
+    s += `\n\nAbout the business: ${cfg.about}`;
+  }
+  s += '\n\nOnly help with things related to this business (its services, hours, appointments, and taking messages).'
+    + ' If someone asks for something unrelated, politely say you can only help with this business and offer to take a message.';
   return s;
 }
 
