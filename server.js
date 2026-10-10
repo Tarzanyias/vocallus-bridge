@@ -76,6 +76,7 @@ async function loadConfig(uid) {
     len: Number(u.appointmentLength) || 30,
     business: u.company || '',
     about: String(u.businessDescription || '').slice(0, 1500),
+    services: cleanServices(u.services),
     afterHours: ['message', 'book', 'forward', 'closed'].includes(u.afterHours) ? u.afterHours : 'message',
     afterHoursMessage: String(u.afterHoursMessage || '').slice(0, 400),
     afterHoursForward: /^\+1\d{10}$/.test(u.afterHoursForward || '') ? u.afterHoursForward : ''
@@ -204,7 +205,21 @@ async function logQuickCall(uid, from, status) {
 /* ---------------- calendar ---------------- */
 
 const BOOKING_LEAD_MIN = Math.max(0, Number(process.env.BOOKING_LEAD_MINUTES || 30));
-async function freeSlots(cfg, dateStr) {
+/* SERVICES_LIST */
+function cleanServices(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map(x => ({ name: String((x && x.name) || '').trim().slice(0, 60),
+                          minutes: Math.round(Number(x && x.minutes) || 0) }))
+    .filter(x => x.name && x.minutes >= 5 && x.minutes <= 480).slice(0, 30);
+}
+function findService(cfg, name) {
+  const list = (cfg && cfg.services) || [];
+  if (!name || !list.length) return null;
+  const n = String(name).toLowerCase().trim();
+  return list.find(s => s.name.toLowerCase() === n) ||
+         list.find(s => s.name.toLowerCase().includes(n) || n.includes(s.name.toLowerCase())) || null;
+}
+async function freeSlots(cfg, dateStr, minutes) {
   const h = cfg.hours[dayKey(dateStr)];
   if (!h || h.closed) return { closed: true, slots: [] };
 
@@ -221,9 +236,11 @@ async function freeSlots(cfg, dateStr) {
 
   const now = Date.now() + BOOKING_LEAD_MIN * 60000;   // never in the past, never too soon
   const slots = [];
-  for (let t = toMin(h.open); t + cfg.len <= toMin(h.close); t += cfg.len) {
+  const dur = Number(minutes) > 0 ? Number(minutes) : cfg.len;
+  const step = dur % cfg.len === 0 ? cfg.len : 15;
+  for (let t = toMin(h.open); t + dur <= toMin(h.close); t += step) {
     const s = zonedToUtc(dateStr, fromMin(t), cfg.tz).getTime();
-    const e = s + cfg.len * 60000;
+    const e = s + dur * 60000;
     if (s < now) continue;
     if (busy.some(([bs, be]) => s < be && e > bs)) continue;
     slots.push(fromMin(t));
@@ -238,7 +255,8 @@ const TOOLS = [{
       description: 'Get the open appointment times on a specific date. Always call this before offering times.',
       parameters: {
         type: 'OBJECT',
-        properties: { date: { type: 'STRING', description: 'Date as YYYY-MM-DD' } },
+        properties: { date: { type: 'STRING', description: 'Date as YYYY-MM-DD' },
+                      service: { type: 'STRING', description: 'Which service the caller wants, if the business has a list' } },
         required: ['date']
       }
     },
@@ -252,7 +270,8 @@ const TOOLS = [{
           time: { type: 'STRING', description: '24-hour time HH:MM, for example 14:30' },
           customer_name: { type: 'STRING' },
           customer_phone: { type: 'STRING', description: 'Callback number if the caller gives a different one' },
-          reason: { type: 'STRING', description: 'Short reason for the visit' }
+          reason: { type: 'STRING', description: 'Short reason for the visit' },
+          service: { type: 'STRING', description: 'Which service from the business list' }
         },
         required: ['date', 'time', 'customer_name']
       }
@@ -296,21 +315,23 @@ async function runTool(cfg, name, args, callerPhone) {
 async function runToolInner(cfg, name, args, callerPhone) {
   try {
     if (name === 'check_availability') {
-      const r = await freeSlots(cfg, args.date);
+      const svc = findService(cfg, args.service);
+      const r = await freeSlots(cfg, args.date, svc && svc.minutes);
       if (r.closed) return { date: args.date, open: false, message: 'The business is closed that day.' };
       if (!r.slots.length) return { date: args.date, open: true, available_times: [], message: 'No open times left that day (it may already be over, or fully booked). Offer another day.' };
       return { date: args.date, open: true, available_times: r.slots.slice(0, 16).map(to12) };
     }
     if (name === 'book_appointment') {
       const time = normTime(args.time);
-      const r = await freeSlots(cfg, args.date);
+      const svc = findService(cfg, args.service);
+      const r = await freeSlots(cfg, args.date, svc && svc.minutes);
       if (r.closed || !r.slots.includes(time)) {
         return { booked: false, reason: 'That time is not available.', other_times: r.slots.slice(0, 8).map(to12) };
       }
       const start = zonedToUtc(args.date, time, cfg.tz);
-      const end = new Date(start.getTime() + cfg.len * 60000);
+      const end = new Date(start.getTime() + ((svc && svc.minutes) || cfg.len) * 60000);
       await db.collection(`users/${cfg.uid}/appointments`).add({
-        title: args.reason || 'Appointment',
+        title: (svc && svc.name) || args.reason || 'Appointment',
         customerName: args.customer_name || '',
         customerPhone: args.customer_phone || callerPhone || '',
         start: admin.firestore.Timestamp.fromDate(start),
@@ -1271,6 +1292,12 @@ function buildSystem(cfg, from, channel) {
   }
   if (cfg.about) {
     s += `\n\nAbout the business: ${cfg.about}`;
+  }
+  if (cfg.services && cfg.services.length) {
+    s += '\n\nServices you can book, and how long each takes: ' +
+      cfg.services.map(x => `${x.name} (${x.minutes} min)`).join(', ') + '.' +
+      ' Ask which service the caller wants before checking times, and pass its exact name as "service"' +
+      ' to check_availability and book_appointment. If they want something not on the list, take a message.';
   }
   s += '\n\nOnly help with things related to this business (its services, hours, appointments, and taking messages).'
     + ' If someone asks for something unrelated, politely say you can only help with this business and offer to take a message.';
