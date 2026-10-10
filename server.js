@@ -1563,5 +1563,35 @@ app.post('/api/account/delete', async (req, reply) => {
   return { deleted: true };
 });
 
+/* ---------------- delete (release) the account's number ---------------- */
+app.post('/api/numbers/release', async (req, reply) => {
+  const user = await requireUser(req, reply);
+  if (!user) return reply;
+  if (!req.body || req.body.confirm !== 'DELETE') return reply.code(400).send({ error: 'Please confirm first.' });
+  const d = user.data || {};
+  if (!d.phoneNumber) return reply.code(404).send({ error: 'This account has no number.' });
+
+  let released = false;
+  if (d.twilioNumberSid && d.numberSource === 'purchased') {
+    try {
+      await twilioApi(`/IncomingPhoneNumbers/${d.twilioNumberSid}.json`, { method: 'DELETE' });
+      released = true;
+    } catch (e) {
+      // Already gone in Twilio? Fine - just unlink it. Anything else: stop so we don't lose track of a paid number.
+      if (!/404|not found|20404/i.test(e.message)) {
+        app.log.error('Release number: ' + e.message);
+        return reply.code(502).send({ error: "Couldn't release the number right now. Please try again." });
+      }
+    }
+  }
+  const del = admin.firestore.FieldValue.delete();
+  await db.doc(`users/${user.uid}`).set({
+    phoneNumber: del, twilioNumberSid: del, numberSource: del, numberCreatedAt: del,
+    numberReleasedAt: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
+  app.log.info(`Number ${d.phoneNumber} ${released ? 'released' : 'unlinked'} for ${user.uid}`);
+  return { ok: true, released };
+});
+
 const port = process.env.PORT || 8080;
 await app.listen({ port, host: '0.0.0.0' });
