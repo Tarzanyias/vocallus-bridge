@@ -79,7 +79,8 @@ async function loadConfig(uid) {
     services: cleanServices(u.services),
     afterHours: ['message', 'book', 'forward', 'closed'].includes(u.afterHours) ? u.afterHours : 'message',
     afterHoursMessage: String(u.afterHoursMessage || '').slice(0, 400),
-    afterHoursForward: /^\+1\d{10}$/.test(u.afterHoursForward || '') ? u.afterHoursForward : ''
+    afterHoursForward: /^\+1\d{10}$/.test(u.afterHoursForward || '') ? u.afterHoursForward : '',
+    backupNumber: /^\+1\d{10}$/.test(u.backupNumber || '') ? u.backupNumber : ''
   };
 }
 
@@ -191,6 +192,54 @@ function hoursPrompt(cfg) {
     ' read it back to confirm, then call take_message.';
   return s;
 }
+/* MINUTE_LIMITS */
+const PLAN_MINUTES = { pro: Number(process.env.PRO_MINUTES || 1000), max: Number(process.env.MAX_MINUTES || 1500) };
+const usageCache = new Map();
+
+function monthOf(tz) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit' })
+    .formatToParts(new Date()).map(x => [x.type, x.value]));
+  return { key: `${p.year}-${p.month}`, start: zonedToUtc(`${p.year}-${p.month}-01`, '00:00', tz) };
+}
+
+// Minutes used this month in the business's time zone. Each call rounds up to a whole minute.
+async function minutesUsed(uid, tz) {
+  const m = monthOf(tz);
+  const hit = usageCache.get(uid);
+  if (hit && hit.key === m.key && Date.now() - hit.at < 30000) return { mins: hit.mins, key: m.key };
+  const snap = await db.collection(`users/${uid}/calls`)
+    .where('startedAt', '>=', admin.firestore.Timestamp.fromDate(m.start)).get();
+  let mins = 0;
+  snap.forEach(d => { mins += Math.ceil((Number(d.data().durationSec) || 0) / 60); });
+  usageCache.set(uid, { at: Date.now(), mins, key: m.key });
+  return { mins, key: m.key };
+}
+
+// true when this customer has used every minute their plan includes.
+async function outOfMinutes(uid, cfg) {
+  const limit = PLAN_MINUTES[cfg.plan] || 0;
+  if (!limit || !db) return false;
+  try {
+    const { mins, key } = await minutesUsed(uid, cfg.tz);
+    if (mins < limit) return false;
+    const ref = db.doc(`users/${uid}`);
+    const u = (await ref.get()).data() || {};
+    if (u.limitNotified !== key) {                               // tell the owner once a month
+      await ref.set({ limitNotified: key }, { merge: true });
+      const where = cfg.backupNumber || (cfg.afterHours === 'forward' ? cfg.afterHoursForward : '');
+      await notifyOwner(uid, "You've used all your minutes",
+        `All ${limit} minutes for this month are used. ` + (where
+          ? 'New calls now ring your backup number until your minutes reset.'
+          : 'Add a backup number (Calendar > Business hours) so callers still reach you, or upgrade your plan.'));
+    }
+    app.log.info(`Out of minutes for ${uid}: ${mins}/${limit}`);
+    return true;
+  } catch (e) {
+    app.log.error('Minute check failed (letting the call through): ' + e.message);
+    return false;
+  }
+}
+
 async function logQuickCall(uid, from, status) {
   if (!db || !uid) return;
   try {
@@ -437,6 +486,20 @@ app.post('/incoming-call', async (req, reply) => {
         return sayAndHang(reply, 'Sorry, this line is not active yet. Goodbye.');
       }
       const cfg = await loadConfig(tenant.uid);
+      if (await outOfMinutes(tenant.uid, cfg)) {
+        const fwd = cfg.backupNumber || (cfg.afterHours === 'forward' ? cfg.afterHoursForward : '');
+        if (fwd && fwd !== to) {
+          await logQuickCall(tenant.uid, from, 'forwarded');
+          return reply.type('text/xml').send(
+            '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+            `<Dial timeout="25" timeLimit="900">${xml(fwd)}</Dial>` +
+            `<Say>${xml('Sorry, no one could pick up. Please try again later. Goodbye.')}</Say>` +
+            '</Response>'
+          );
+        }
+        await logQuickCall(tenant.uid, from, 'out-of-minutes');
+        return sayAndHang(reply, "Sorry, we can't take your call right now. Please try again later. Goodbye.");
+      }
       if (!isOpenNow(cfg)) {
         if (cfg.afterHours === 'closed') {
           await logQuickCall(tenant.uid, from, 'after-hours');
