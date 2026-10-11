@@ -337,6 +337,14 @@ const TOOLS = [{
         },
         required: ['caller_name', 'message']
       }
+    },
+    {
+      name: 'end_call',
+      description: 'Hang up the phone. Call this only after the caller has nothing else and you have already said goodbye.',
+      parameters: {
+        type: 'OBJECT',
+        properties: { reason: { type: 'STRING', description: 'Optional: why the call is ending' } }
+      }
     }
   ]
 }];
@@ -362,6 +370,7 @@ async function runTool(cfg, name, args, callerPhone) {
   return result;
 }
 async function runToolInner(cfg, name, args, callerPhone) {
+  if (name === 'end_call') return { ok: true };
   try {
     if (name === 'check_availability') {
       const svc = findService(cfg, args.service);
@@ -429,6 +438,13 @@ function pcmToUlaw(sample) {
   for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
   const mantissa = (sample >> (exponent + 3)) & 0x0f;
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+// u-law phone sample -> 16-bit level (used to tell when the caller is talking)
+const ULAW_PCM = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  const u = ~i & 0xff;
+  const s = ((((u & 0x0f) << 3) + 0x84) << ((u >> 4) & 7)) - 0x84;
+  ULAW_PCM[i] = (u & 0x80) ? -s : s;
 }
 function twilioToGemini(b64) {
   const ulaw = Buffer.from(b64, 'base64');
@@ -538,6 +554,54 @@ app.post('/incoming-call', async (req, reply) => {
 app.get('/media-stream', { websocket: true }, (twilio) => {
   let streamSid = null, agent = null, cfg = null, from = '', callRef = null, startedAt = Date.now();
   const transcript = [];
+  /* CALL_SAVINGS */
+  const MAX_CALL_MS = Math.max(2, Number(process.env.MAX_CALL_MINUTES || 10)) * 60000;
+  let lastVoice = Date.now(), lastOut = 0, playUntil = 0, talkOver = 0, floor = 300, nudged = 0;
+  let wrapSent = false, byeAt = 0, watch = null, byeTimer = null;
+  const preroll = [];
+  const loud = (b64) => {                              // is the caller talking? (simple loudness check)
+    const b = Buffer.from(b64, 'base64');
+    if (!b.length) return false;
+    let sum = 0;
+    for (let i = 0; i < b.length; i++) { const v = ULAW_PCM[b[i]]; sum += v * v; }
+    const rms = Math.sqrt(sum / b.length);
+    const speech = rms > Math.max(450, floor * 3);
+    if (!speech) floor = floor * 0.98 + rms * 0.02;
+    return speech;
+  };
+  function hangUp(why) {
+    if (byeAt) return;
+    byeAt = Date.now();
+    app.log.info(`Ending call (${why})`);
+    const wait = () => {
+      const now = Date.now();
+      if ((now < playUntil + 400 || now - lastOut < 1500) && now - byeAt < 20000) { byeTimer = setTimeout(wait, 250); return; }
+      if (streamSid) { try { twilio.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'vc-bye' } })); } catch {} }
+      byeTimer = setTimeout(() => { try { twilio.close(); } catch {} }, 3000);
+    };
+    byeTimer = setTimeout(wait, 700);
+  }
+  function startWatch() {
+    lastVoice = Date.now();
+    watch = setInterval(() => {
+      if (byeAt || !agent) return;
+      const now = Date.now();
+      if (now - startedAt > MAX_CALL_MS) return hangUp('time limit');
+      if (!wrapSent && now - startedAt > MAX_CALL_MS - 60000 && agent.nudge) {
+        wrapSent = true;
+        agent.nudge('(Note: this call is almost at its time limit. Politely wrap up now: offer to take a message if needed, say goodbye, then call end_call.)');
+      }
+      const quiet = now - Math.max(lastVoice, playUntil);
+      if (quiet > 22000) {
+        if (agent.nudge) agent.nudge('(Note: the caller is still silent. Say a short goodbye now, then call end_call.)');
+        return hangUp('silence');
+      }
+      if (quiet > 11000 && !nudged && agent.nudge) {
+        nudged = 1;
+        agent.nudge('(Note: the caller has been silent for a while. Briefly ask if they are still there.)');
+      }
+    }, 1000);
+  }
 
   twilio.on('message', async (raw) => {
     let msg;
@@ -564,21 +628,41 @@ app.get('/media-stream', { websocket: true }, (twilio) => {
         tools: !!cfg.uid,
         system: buildSystem(cfg, from, 'call'),
         greet: 'A caller just connected. Greet them warmly and ask how you can help.',
-        runTool: (name, args) => runTool(cfg, name, args, from),
-        onAudio: (b64) => { if (streamSid) twilio.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } })); },
-        onClear: () => { if (streamSid) twilio.send(JSON.stringify({ event: 'clear', streamSid })); },
+        runTool: (name, args) => name === 'end_call'
+          ? (hangUp('goodbye'), { ok: true, note: 'Hanging up when your goodbye finishes. Do not start anything new.' })
+          : runTool(cfg, name, args, from),
+        onAudio: (b64) => {
+          const now = Date.now();
+          lastOut = now;
+          playUntil = Math.max(now, playUntil) + Math.floor(b64.length * 3 / 4) / 8;   // 8 bytes = 1 ms of phone audio
+          if (streamSid) twilio.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }));
+        },
+        onClear: () => { playUntil = Date.now(); if (streamSid) twilio.send(JSON.stringify({ event: 'clear', streamSid })); },
         onCaption: (who, text) => addLine(transcript, who === 'caller' ? 'Caller' : cfg.agentName, text),
         onError: (m) => app.log.error('AI error: ' + m),
         onClose: () => { try { twilio.close(); } catch {} }
       });
+      startWatch();
     } else if (msg.event === 'media') {
-      if (agent) agent.sendAudio(msg.media.payload);
+      const p = msg.media.payload, now = Date.now(), speech = loud(p);
+      if (speech) { lastVoice = now; nudged = 0; }
+      if (!agent) return;
+      if (now < playUntil && !speech && now > talkOver) {   // Solana is talking, caller is quiet: don't pay to send it
+        preroll.push(p); if (preroll.length > 10) preroll.shift();
+        return;
+      }
+      if (speech && now < playUntil) talkOver = now + 1500;  // caller talking over her: send everything for a bit
+      while (preroll.length) agent.sendAudio(preroll.shift());
+      agent.sendAudio(p);
+    } else if (msg.event === 'mark') {
+      if (msg.mark && msg.mark.name === 'vc-bye') { try { twilio.close(); } catch {} }
     } else if (msg.event === 'stop') {
       if (agent) agent.close();
     }
   });
 
   twilio.on('close', async () => {
+    clearInterval(watch); clearTimeout(byeTimer);
     if (agent) agent.close();
     const durationSec = Math.round((Date.now() - startedAt) / 1000);
     if (callRef) {
@@ -1039,6 +1123,10 @@ function geminiAgentOnce(cfg, o, model) {
       if (ready && ws.readyState === WebSocket.OPEN) ws.send(frame);
       else if (pending.length < 100) pending.push(frame);
     },
+    nudge(text) {
+      if (ready && toolBusy === 0 && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', parts: [{ text }] }], turnComplete: true } }));
+    },
     close() { closed = true; try { ws.close(); } catch {} }
   };
 }
@@ -1079,6 +1167,7 @@ function geminiAgent(cfg, o) {
   start();
   return {
     sendAudio(b64) { if (isReady) cur.sendAudio(b64); else if (buf.length < 100) buf.push(b64); },
+    nudge(t) { if (isReady && cur && cur.nudge) cur.nudge(t); },
     close() { stopped = true; if (cur) cur.close(); }
   };
 }
@@ -1342,6 +1431,7 @@ function buildSystem(cfg, from, channel) {
       ' Reply in short, natural sentences like you would on the phone. Plain text only, no markdown.';
   } else {
     s += ` The caller's number is ${from || 'unknown'}. Speak like a real person on the phone and keep replies short.`;
+    if (cfg.uid) s += ' When the caller has nothing else, say a short goodbye and then call end_call to hang up.';
   }
   if (cfg.uid) {
     s += hoursPrompt(cfg);
