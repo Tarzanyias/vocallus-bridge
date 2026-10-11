@@ -758,6 +758,17 @@ app.post('/api/numbers/buy', async (req, reply) => {
   }
   const phone = String((req.body && req.body.phoneNumber) || '');
   if (!/^\+1\d{10}$/.test(phone)) return reply.code(400).send({ error: 'Invalid phone number.' });
+  /* NUMBER_FEE */
+  const prior = Number.isFinite(user.data.numbersBought) ? user.data.numbersBought : (user.data.numberReleasedAt ? 1 : 0);
+  let paid = null;
+  if (prior >= 1 && NEW_NUMBER_FEE > 0) {
+    if (!(req.body && req.body.confirmFee === true)) {
+      return reply.code(402).send({ needsFee: true, fee: NEW_NUMBER_FEE,
+        error: `Your plan includes one number. A new number is a one-time $${(NEW_NUMBER_FEE / 100).toFixed(2)}.` });
+    }
+    try { paid = await chargeNumberFee(user, prior, phone); }
+    catch (e) { return reply.code(402).send({ error: e.message }); }
+  }
   try {
     const r = await twilioApi('/IncomingPhoneNumbers.json', {
       method: 'POST',
@@ -773,14 +784,54 @@ app.post('/api/numbers/buy', async (req, reply) => {
       phoneNumber: r.phone_number,
       twilioNumberSid: r.sid,
       numberSource: 'purchased',
-      numberCreatedAt: admin.firestore.FieldValue.serverTimestamp()
+      numberCreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      numbersBought: prior + 1
     }, { merge: true });
-    app.log.info(`Bought ${r.phone_number} for ${user.uid}`);
-    return { phoneNumber: r.phone_number };
+    app.log.info(`Bought ${r.phone_number} for ${user.uid}` + (paid ? ` (fee ${paid.id})` : ''));
+    return { phoneNumber: r.phone_number, charged: paid ? paid.amount : 0 };
   } catch (e) {
+    if (paid) {                                   // number failed after the charge: give the money back
+      try { await stripe.refunds.create({ payment_intent: paid.id }); app.log.info('Refunded number fee ' + paid.id); }
+      catch (re) { app.log.error('NUMBER FEE REFUND FAILED ' + paid.id + ': ' + re.message); }
+      return reply.code(502).send({ error: "Couldn't get that number, so your $" + (paid.amount / 100).toFixed(2) + ' was refunded. Try another number.' });
+    }
     return reply.code(502).send({ error: e.message });
   }
 });
+
+/* ---------------- replacement number fee ---------------- */
+const NEW_NUMBER_FEE = Math.max(0, Math.round(Number(process.env.NEW_NUMBER_FEE_CENTS ?? 500)));
+async function chargeNumberFee(user, prior, phone) {
+  if (typeof stripe === 'undefined' || !stripe) throw new Error('Payments are not set up yet. Please contact support.');
+  const d = user.data;
+  if (!d.stripeCustomerId) throw new Error('No card on file. Add a payment method in Billing first.');
+  let pm = null;
+  if (d.stripeSubscriptionId) {
+    try { pm = (await stripe.subscriptions.retrieve(d.stripeSubscriptionId)).default_payment_method; } catch {}
+  }
+  if (!pm) {
+    try { const c = await stripe.customers.retrieve(d.stripeCustomerId); pm = c.invoice_settings && c.invoice_settings.default_payment_method; } catch {}
+  }
+  if (!pm) {
+    try { const l = await stripe.paymentMethods.list({ customer: d.stripeCustomerId, type: 'card', limit: 1 }); pm = l.data[0] && l.data[0].id; } catch {}
+  }
+  if (!pm) throw new Error('No card on file. Add a payment method in Billing first.');
+  try {
+    const pi = await stripe.paymentIntents.create({
+      amount: NEW_NUMBER_FEE, currency: 'usd',
+      customer: d.stripeCustomerId, payment_method: typeof pm === 'string' ? pm : pm.id,
+      off_session: true, confirm: true,
+      description: 'Vocallus - new phone number',
+      metadata: { uid: user.uid, type: 'number_fee', previousNumbers: String(prior) }
+    }, { idempotencyKey: `numfee-${user.uid}-${prior}-${phone}-${Math.floor(Date.now() / 60000)}` });   // no double charge on a double click
+    if (pi.status !== 'succeeded') throw Object.assign(new Error('not completed'), { code: 'authentication_required' });
+    app.log.info(`Number fee charged for ${user.uid}: ${pi.id}`);
+    return pi;
+  } catch (e) {
+    if (e.code === 'authentication_required') throw new Error('Your bank wants to confirm this charge. Update your card in Billing, then try again.');
+    throw new Error('Your card was declined' + (e.message ? ': ' + e.message : '.'));
+  }
+}
 
 /* ---------------- Stripe webhook ---------------- */
 import crypto from 'node:crypto';
@@ -1767,7 +1818,9 @@ app.post('/api/numbers/release', async (req, reply) => {
   const del = admin.firestore.FieldValue.delete();
   await db.doc(`users/${user.uid}`).set({
     phoneNumber: del, twilioNumberSid: del, numberSource: del, numberCreatedAt: del,
-    numberReleasedAt: admin.firestore.FieldValue.serverTimestamp()
+    numberReleasedAt: admin.firestore.FieldValue.serverTimestamp(),
+    // only numbers bought through Vocallus count toward the free one
+    numbersBought: Number.isFinite(d.numbersBought) ? d.numbersBought : (d.numberSource === 'purchased' ? 1 : 0)
   }, { merge: true });
   app.log.info(`Number ${d.phoneNumber} ${released ? 'released' : 'unlinked'} for ${user.uid}`);
   return { ok: true, released };
